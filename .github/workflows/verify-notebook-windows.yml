@@ -1,7 +1,7 @@
 name: Verify notebook preview on Windows
 on:
   push:
-    branches: [capy/verify-notebook-windows-2f76bde]
+    branches: [capy/verify-notebook-windows-ce09384]
 
 permissions:
   contents: read
@@ -21,12 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          ref: 2f76bde61277f95969a8cb129c6ad4593080a8f7
+          ref: ce09384c6d931e0678211b07b762457403b87b1b
           persist-credentials: false
       - name: Verify product commit and Windows host
         shell: pwsh
         run: |
-          if ((git rev-parse HEAD) -ne '2f76bde61277f95969a8cb129c6ad4593080a8f7') { throw 'Wrong revision' }
+          if ((git rev-parse HEAD) -ne 'ce09384c6d931e0678211b07b762457403b87b1b') { throw 'Wrong revision' }
           git show -s --format='%H %s'
           [Environment]::OSVersion.VersionString
           rustc -Vv
@@ -36,7 +36,7 @@ jobs:
         run: |
           cargo test --locked -p repl --lib notebook::preview::preview_tests:: -- --nocapture 2>&1 | Tee-Object "$env:RUNNER_TEMP/notebook-tests.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (!(Select-String -Quiet -SimpleMatch '2 passed; 0 failed' "$env:RUNNER_TEMP/notebook-tests.txt")) { throw 'Expected both preview tests to run' }
+          if (!(Select-String -Quiet -SimpleMatch '3 passed; 0 failed' "$env:RUNNER_TEMP/notebook-tests.txt")) { throw 'Expected all three preview tests to run' }
       - name: Build the Windows editor
         shell: pwsh
         run: cargo build --locked -p zed --bin zed
@@ -83,6 +83,15 @@ jobs:
             $graphics = [Drawing.Graphics]::FromImage($image)
             $graphics.CopyFromScreen($rect.Left,$rect.Top,0,0,$image.Size)
             $image.Save("$env:RUNNER_TEMP/notebook-window.png")
+            [System.Windows.Forms.SendKeys]::SendWait('^+p')
+            Start-Sleep -Seconds 1
+            [System.Windows.Forms.SendKeys]::SendWait('notebook: edit source{ENTER}')
+            Start-Sleep -Seconds 2
+            [System.Windows.Forms.SendKeys]::SendWait('^\')
+            Start-Sleep -Seconds 2
+            if ([NotebookWindow]::GetForegroundWindow() -ne $window) { throw 'Zed lost foreground after splitting' }
+            $graphics.CopyFromScreen($rect.Left,$rect.Top,0,0,$image.Size)
+            $image.Save("$env:RUNNER_TEMP/notebook-split.png")
             $graphics.Dispose()
             $image.Dispose()
             if ((Get-FileHash $file).Hash -ne $before) { throw 'Opening the notebook changed it' }
@@ -96,5 +105,6 @@ jobs:
           path: |
             ${{ runner.temp }}/notebook-tests.txt
             ${{ runner.temp }}/notebook-window.png
+            ${{ runner.temp }}/notebook-split.png
           if-no-files-found: ignore
           retention-days: 7
