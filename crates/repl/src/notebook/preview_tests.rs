@@ -1,4 +1,4 @@
-use super::{NotebookPreview, PreviewCell};
+use super::NotebookPreview;
 use editor::Editor;
 use feature_flags::{
     FeatureFlag as _, FeatureFlagAppExt as _, FeatureFlagStore, NotebookFeatureFlag,
@@ -95,10 +95,21 @@ async fn test_notebook_preview_keeps_the_original_source(cx: &mut TestAppContext
         let preview = workspace
             .active_item_as::<NotebookPreview>(cx)
             .expect("notebook preview");
-        assert!(matches!(preview.read(cx).cells.as_slice(),
-            [PreviewCell::Markdown(markdown), PreviewCell::Code(code)]
-            if markdown.as_ref() == "# Field notes\n![sample](attachment:sample.png)"
-                && code.as_ref() == "print('from source')"));
+        let cells = preview
+            .read(cx)
+            .notebook
+            .as_ref()
+            .expect("editable notebook")
+            .read(cx);
+        assert_eq!(
+            cells.cell(0).expect("Markdown").current_source(cx),
+            "# Field notes\n![sample](attachment:sample.png)"
+        );
+        assert_eq!(
+            cells.cell(1).expect("code").current_source(cx),
+            "print('from source')"
+        );
+        assert!(cells.cell(2).is_none());
         assert!(!workspace.active_item(cx).expect("notebook").is_dirty(cx));
     });
     cx.dispatch_action(workspace::Save { save_intent: None });
@@ -131,7 +142,7 @@ async fn test_notebook_preview_keeps_the_original_source(cx: &mut TestAppContext
             .tab_extra_context_menu_actions(window, cx)
             .into_iter()
             .find(|(_, action)| action.partial_eq(&OpenNotebook))
-            .expect("Open Notebook Preview in the source tab menu");
+            .expect("Open Notebook Editor in the source tab menu");
         window.dispatch_action(action, cx);
     });
     cx.run_until_parked();
@@ -139,8 +150,19 @@ async fn test_notebook_preview_keeps_the_original_source(cx: &mut TestAppContext
         let preview = workspace
             .active_item_as::<NotebookPreview>(cx)
             .expect("notebook preview");
-        assert!(matches!(preview.read(cx).cells.first(),
-            Some(PreviewCell::Markdown(markdown)) if markdown.contains("Unsaved notes")));
+        let notebook = preview
+            .read(cx)
+            .notebook
+            .as_ref()
+            .expect("editable notebook");
+        assert!(
+            notebook
+                .read(cx)
+                .cell(0)
+                .expect("Markdown")
+                .current_source(cx)
+                .contains("Unsaved notes")
+        );
     });
     cx.dispatch_action(EditSource);
     workspace.read_with(cx, |workspace, cx| {
@@ -163,6 +185,74 @@ async fn test_notebook_preview_keeps_the_original_source(cx: &mut TestAppContext
             .expect("read notebook"),
         NOTEBOOK.as_bytes(),
     );
+}
+
+#[gpui::test]
+async fn test_edit_and_save_cells_in_restricted_mode(cx: &mut TestAppContext) {
+    let (fs, workspace, cx) = notebook_workspace(json!({"field.ipynb": NOTEBOOK}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    cx.dispatch_action(EditSource);
+    cx.dispatch_action(OpenNotebook);
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.active_pane().read(cx).items_len(), 1);
+    });
+    let view = workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .active_item_as::<NotebookPreview>(cx)
+            .expect("notebook tab")
+    });
+    for (index, replacement) in [(0, "# Updated notes\n"), (1, "print('revised')\n")] {
+        let editor = view.read_with(cx, |view, cx| {
+            view.notebook
+                .as_ref()
+                .expect("notebook")
+                .read(cx)
+                .cell(index)
+                .expect("cell")
+                .editor(cx)
+                .expect("editable")
+                .clone()
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(replacement, window, cx);
+        });
+        cx.run_until_parked();
+    }
+    assert!(view.read_with(cx, |view, cx| workspace::Item::is_dirty(view, cx)));
+    assert_eq!(
+        fs.load_bytes(Path::new(path!("/notebooks/field.ipynb")))
+            .await
+            .expect("read file"),
+        NOTEBOOK.as_bytes()
+    );
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    cx.run_until_parked();
+    let saved = fs
+        .load_bytes(Path::new(path!("/notebooks/field.ipynb")))
+        .await
+        .expect("read file");
+    let mut expected: Value = serde_json::from_str(NOTEBOOK).expect("fixture");
+    expected["cells"][0]["source"] = json!(["# Updated notes\n"]);
+    expected["cells"][1]["source"] = json!(["print('revised')\n"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&saved).expect("saved notebook"),
+        expected
+    );
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace.active_item_as::<NotebookPreview>(cx),
+            Some(view.clone())
+        );
+        assert!(!view.is_dirty(cx));
+    });
+    cx.dispatch_action(EditSource);
+    workspace.read_with(cx, |workspace, cx| {
+        let source = workspace
+            .active_item_as::<Editor>(cx)
+            .expect("source editor");
+        assert_eq!(source.read(cx).text(cx).as_bytes(), saved);
+    });
 }
 
 #[gpui::test]

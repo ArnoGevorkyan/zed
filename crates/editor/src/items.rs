@@ -1241,7 +1241,7 @@ impl Item for Editor {
 
         if file_extension.is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb")) {
             actions.push((
-                "Open Notebook Preview".into(),
+                "Open Notebook Editor".into(),
                 Box::new(zed_actions::notebook::OpenNotebook),
             ));
         }

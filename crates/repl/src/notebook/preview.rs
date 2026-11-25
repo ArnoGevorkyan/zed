@@ -1,21 +1,16 @@
-use std::path::Path;
-
 use anyhow::{Context as _, Result};
 use collections::HashSet;
 use editor::{Editor, EditorEvent};
-use feature_flags::{FeatureFlagAppExt as _, NotebookFeatureFlag};
-use gpui::{
-    App, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global, ListAlignment, ListState,
-    Task, WeakEntity, list,
-};
-use markdown::MarkdownLabel;
-use project::{Project, ProjectPath};
+
+use gpui::{App, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global, Task, WeakEntity};
+
+use project::{Project, ProjectItem as _, ProjectPath};
 use ui::prelude::*;
-use workspace::item::{ItemBufferKind, SerializableItem, TabContentParams};
+use workspace::item::{ItemBufferKind, ItemEvent, SaveOptions, SerializableItem, TabContentParams};
 use workspace::{Item, ItemHandle, ItemId, Pane, Workspace, WorkspaceId};
 use zed_actions::notebook::{EditSource, OpenNotebook};
 
-use super::notebook_ui::upgrade_notebook;
+use super::{NotebookEditor, NotebookItem};
 
 #[cfg(test)]
 #[path = "preview_tests.rs"]
@@ -25,36 +20,11 @@ mod preview_tests;
 struct SourceEditors(HashSet<EntityId>);
 impl Global for SourceEditors {}
 
-enum PreviewCell {
-    Markdown(SharedString),
-    Code(SharedString),
-    Raw(SharedString),
-}
-
-impl PreviewCell {
-    fn parse(source: &str) -> Result<Vec<Self>> {
-        let notebook = upgrade_notebook(nbformat::parse_notebook(source)?)?;
-        Ok(notebook
-            .cells
-            .into_iter()
-            .map(|cell| match cell {
-                nbformat::v4::Cell::Markdown { source, .. } => {
-                    Self::Markdown(source.concat().into())
-                }
-                nbformat::v4::Cell::Code { source, .. } => Self::Code(source.concat().into()),
-                nbformat::v4::Cell::Raw { source, .. } => Self::Raw(source.concat().into()),
-            })
-            .collect())
-    }
-}
-
 pub struct NotebookPreview {
     workspace: WeakEntity<Workspace>,
     editor: Entity<Editor>,
     focus_handle: FocusHandle,
-    cells: Vec<PreviewCell>,
-    list: ListState,
-    alongside_source: bool,
+    notebook: Option<Entity<NotebookEditor>>,
     restore_source: bool,
 }
 
@@ -71,8 +41,6 @@ pub(super) fn init(cx: &mut App) {
                 return;
             };
             if workspace.is_restoring()
-                || cx.has_flag::<NotebookFeatureFlag>()
-                || std::env::var_os("LOCAL_NOTEBOOK_DEV").is_some()
                 || cx.global::<SourceEditors>().0.contains(&item.item_id())
                 || item.is_dirty(cx)
             {
@@ -104,22 +72,16 @@ impl NotebookPreview {
         let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
             return;
         };
-        let is_notebook = |buffer: &language::Buffer, cx: &App| {
-            buffer.file().is_some_and(|file| {
-                Path::new(file.file_name(cx))
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("ipynb"))
-            })
-        };
-        if !is_notebook(buffer.read(cx), cx) {
+        let Some(path) = editor.read(cx).active_project_path(cx) else {
             return;
-        }
+        };
         let Some(pane) = workspace.pane_for_item_id(editor.entity_id()) else {
             return;
         };
+        let Some(parse) = NotebookItem::try_open(workspace.project(), &path, cx) else {
+            return;
+        };
         let version = buffer.read(cx).version();
-        let text = buffer.read(cx).as_rope().clone();
-        let parse = cx.background_spawn(async move { PreviewCell::parse(&text.to_string()) });
         cx.spawn_in(window, async move |workspace, cx| {
             let cells = parse.await;
             workspace.update_in(cx, |workspace, window, cx| {
@@ -127,7 +89,7 @@ impl NotebookPreview {
                 if workspace.pane_for_item_id(editor.entity_id()).as_ref() != Some(&pane)
                     || pane.read(cx).index_for_item(&editor).is_none()
                     || buffer.read(cx).version() != version
-                    || !is_notebook(buffer.read(cx), cx)
+                    || editor.read(cx).active_project_path(cx).as_ref() != Some(&path)
                     || (!explicit
                         && (dirty
                             || workspace.is_restoring()
@@ -156,20 +118,17 @@ impl NotebookPreview {
                     Ok(cells) => cells,
                     Err(error) => {
                         if explicit {
-                            workspace.show_error(error.context("Could not preview notebook"), cx);
+                            workspace
+                                .show_error(error.context("Could not open notebook cells"), cx);
                         }
                         return;
                     }
                 };
                 let owner = cx.weak_entity();
-                let preview = cx
-                    .new(|cx| Self::new(owner, editor.clone(), Some(cells), explicit, window, cx));
+                let preview =
+                    cx.new(|cx| Self::new(owner, editor.clone(), Some(cells), window, cx));
                 pane.update(cx, |pane, cx| {
-                    if explicit {
-                        pane.add_item(Box::new(preview), true, true, None, window, cx);
-                    } else {
-                        Self::replace_tab(pane, &editor, Box::new(preview), false, window, cx);
-                    }
+                    Self::replace_tab(pane, &editor, Box::new(preview), explicit, window, cx);
                 });
             })
         })
@@ -179,31 +138,42 @@ impl NotebookPreview {
     fn new(
         workspace: WeakEntity<Workspace>,
         editor: Entity<Editor>,
-        cells: Option<Vec<PreviewCell>>,
-        alongside_source: bool,
+        parsed: Option<Entity<NotebookItem>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let notebook = parsed.and_then(|item| {
+            let project = editor.read(cx).project()?.clone();
+            let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+            if !buffer.read(cx).capability().editable() || item.read(cx).buffer != buffer {
+                return None;
+            }
+            Some(cx.new(|cx| NotebookEditor::new(project, item, window, cx)))
+        });
         cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
-            if matches!(
-                event,
-                EditorEvent::BufferEdited | EditorEvent::FileHandleChanged
-            ) {
+            Editor::to_item_events(event, &mut |event| cx.emit(event));
+            let external_edit = matches!(event, EditorEvent::BufferEdited)
+                && this
+                    .notebook
+                    .as_ref()
+                    .is_some_and(|notebook| !notebook.read(cx).source_is_current(cx));
+            let changed_file = matches!(event, EditorEvent::FileHandleChanged)
+                && this.notebook.as_ref().is_some_and(|notebook| {
+                    this.editor.read(cx).active_project_path(cx).as_ref()
+                        != Some(notebook.read(cx).project_path(cx))
+                });
+            if external_edit || changed_file || matches!(event, EditorEvent::CapabilityChanged) {
                 this.restore_source = true;
                 this.show_source(false, window, cx);
             }
         })
         .detach();
-        let restore_source = cells.is_none();
-        let cells = cells.unwrap_or_default();
         Self {
             workspace,
             editor,
             focus_handle: cx.focus_handle(),
-            list: ListState::new(cells.len(), ListAlignment::Top, px(400.)),
-            cells,
-            alongside_source,
-            restore_source,
+            restore_source: notebook.is_none(),
+            notebook,
         }
     }
 
@@ -293,24 +263,26 @@ impl NotebookPreview {
     }
 }
 
-impl EventEmitter<()> for NotebookPreview {}
+impl EventEmitter<ItemEvent> for NotebookPreview {}
 
 impl Focusable for NotebookPreview {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.notebook
+            .as_ref()
+            .map(|view| view.focus_handle(cx))
+            .unwrap_or_else(|| self.focus_handle.clone())
     }
 }
 
 impl Item for NotebookPreview {
-    type Event = ();
+    type Event = ItemEvent;
+
+    fn to_item_events(event: &ItemEvent, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event);
+    }
 
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
-        let title = self.editor.read(cx).tab_content_text(detail, cx);
-        if self.alongside_source {
-            format!("Preview {title}").into()
-        } else {
-            title
-        }
+        self.editor.read(cx).tab_content_text(detail, cx)
     }
 
     fn tab_content(&self, params: TabContentParams, _: &Window, cx: &App) -> AnyElement {
@@ -330,11 +302,7 @@ impl Item for NotebookPreview {
     }
 
     fn buffer_kind(&self, _: &App) -> ItemBufferKind {
-        if self.alongside_source {
-            ItemBufferKind::None
-        } else {
-            ItemBufferKind::Singleton
-        }
+        ItemBufferKind::Singleton
     }
 
     fn for_each_project_item(
@@ -342,17 +310,82 @@ impl Item for NotebookPreview {
         cx: &App,
         visit: &mut dyn FnMut(EntityId, &dyn project::ProjectItem),
     ) {
-        if !self.alongside_source {
-            self.editor.read(cx).for_each_project_item(cx, visit);
-        }
+        self.editor.read(cx).for_each_project_item(cx, visit);
     }
 
     fn show_toolbar(&self) -> bool {
         false
     }
 
-    fn capability(&self, _: &App) -> language::Capability {
-        language::Capability::ReadOnly
+    fn capability(&self, cx: &App) -> language::Capability {
+        self.editor.read(cx).capability(cx)
+    }
+
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.editor.is_dirty(cx)
+    }
+
+    fn has_conflict(&self, cx: &App) -> bool {
+        self.editor.has_conflict(cx)
+    }
+
+    fn has_deleted_file(&self, cx: &App) -> bool {
+        self.editor.has_deleted_file(cx)
+    }
+
+    fn can_save(&self, cx: &App) -> bool {
+        self.editor.can_save(cx)
+    }
+
+    fn save(
+        &mut self,
+        options: SaveOptions,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if let Some(notebook) = &self.notebook {
+            notebook.update(cx, |notebook, cx| {
+                notebook.save(options, project, window, cx)
+            })
+        } else {
+            self.editor.update(cx, |editor, cx| {
+                editor.save(
+                    SaveOptions {
+                        format: false,
+                        ..options
+                    },
+                    project,
+                    window,
+                    cx,
+                )
+            })
+        }
+    }
+
+    fn can_save_as(&self, cx: &App) -> bool {
+        self.editor.can_save_as(cx)
+    }
+
+    fn save_as(
+        &mut self,
+        project: Entity<Project>,
+        path: ProjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.editor
+            .update(cx, |editor, cx| editor.save_as(project, path, window, cx))
+    }
+
+    fn reload(
+        &mut self,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.editor
+            .update(cx, |editor, cx| editor.reload(project, window, cx))
     }
 
     fn added_to_workspace(
@@ -369,7 +402,6 @@ impl Item for NotebookPreview {
 
 impl Render for NotebookPreview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
         v_flex()
             .size_full()
             .track_focus(&self.focus_handle)
@@ -384,7 +416,7 @@ impl Render for NotebookPreview {
                     .py_1()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(Label::new("Notebook Preview").color(Color::Muted))
+                    .child(Label::new("Notebook").color(Color::Muted))
                     .child(
                         Button::new("edit-source", "Edit Source")
                             .start_icon(Icon::new(IconName::Code))
@@ -393,46 +425,7 @@ impl Render for NotebookPreview {
                             })),
                     ),
             )
-            .when_else(
-                self.cells.is_empty(),
-                |view| {
-                    view.child(
-                        div()
-                            .p_4()
-                            .child(Label::new("This notebook is empty.").color(Color::Muted)),
-                    )
-                },
-                |container| {
-                    container.child(
-                        list(self.list.clone(), move |index, _, cx| {
-                            let cell = view.read(cx).cells.get(index);
-                            let content = match cell {
-                                Some(PreviewCell::Markdown(text)) => {
-                                    MarkdownLabel(text.clone()).into_any_element()
-                                }
-                                Some(PreviewCell::Code(text) | PreviewCell::Raw(text)) => div()
-                                    .w_full()
-                                    .p_3()
-                                    .rounded_md()
-                                    .bg(cx.theme().colors().editor_subheader_background)
-                                    .font_buffer(cx)
-                                    .child(text.clone())
-                                    .into_any_element(),
-                                None => return div().into_any_element(),
-                            };
-                            div()
-                                .id(("notebook-cell", index))
-                                .w_full()
-                                .px_4()
-                                .py_2()
-                                .child(content)
-                                .into_any_element()
-                        })
-                        .flex_1()
-                        .w_full(),
-                    )
-                },
-            )
+            .children(self.notebook.clone())
     }
 }
 
@@ -445,18 +438,17 @@ impl SerializableItem for NotebookPreview {
         &mut self,
         workspace: &mut Workspace,
         item_id: ItemId,
-        _: bool,
+        closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
+        if closing && self.is_dirty(cx) {
+            return None;
+        }
         let workspace_id = workspace.database_id()?;
         let path = self.editor.read(cx).active_project_path(cx)?;
         let path = workspace.project().read(cx).absolute_path(&path, cx)?;
         let db = persistence::NotebookPreviewDb::global(cx);
-        let alongside_source = self.alongside_source;
-        Some(cx.background_spawn(async move {
-            db.save_path(item_id, workspace_id, path, alongside_source)
-                .await
-        }))
+        Some(cx.background_spawn(async move { db.save_path(item_id, workspace_id, path).await }))
     }
 
     fn should_serialize(&self, _: &Self::Event) -> bool {
@@ -473,7 +465,7 @@ impl SerializableItem for NotebookPreview {
     ) -> Task<Result<Entity<Self>>> {
         let db = persistence::NotebookPreviewDb::global(cx);
         window.spawn(cx, async move |cx| {
-            let (path, alongside_source) = db
+            let path = db
                 .get_path(item_id, workspace_id)?
                 .context("No saved notebook path")?;
             let (worktree, path) = project
@@ -486,20 +478,20 @@ impl SerializableItem for NotebookPreview {
                 path,
             };
             let buffer = project
-                .update(cx, |project, cx| project.open_buffer(path, cx))
+                .update(cx, |project, cx| project.open_buffer(path.clone(), cx))
                 .await?;
-            let (text, version) =
-                buffer.read_with(cx, |buffer, _| (buffer.as_rope().clone(), buffer.version()));
-            let cells = cx
-                .background_spawn(async move { PreviewCell::parse(&text.to_string()).ok() })
-                .await;
+            let version = buffer.read_with(cx, |buffer, _| buffer.version());
+            let parse = cx.update(|_, cx| NotebookItem::try_open(&project, &path, cx))?;
+            let cells = match parse {
+                Some(parse) => parse.await.ok(),
+                None => None,
+            };
             cx.update(|window, cx| {
                 let cells = cells.filter(|_| {
-                    (alongside_source || !buffer.read(cx).is_dirty())
-                        && buffer.read(cx).version() == version
+                    !buffer.read(cx).is_dirty() && buffer.read(cx).version() == version
                 });
                 let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project), window, cx));
-                cx.new(|cx| Self::new(workspace, editor, cells, alongside_source, window, cx))
+                cx.new(|cx| Self::new(workspace, editor, cells, window, cx))
             })
         })
     }
@@ -549,13 +541,13 @@ mod persistence {
 
     impl NotebookPreviewDb {
         query! {
-            pub async fn save_path(item_id: ItemId, workspace_id: WorkspaceId, path: PathBuf, alongside_source: bool) -> Result<()> {
-                INSERT OR REPLACE INTO notebook_previews(item_id, workspace_id, path, alongside_source) VALUES (?, ?, ?, ?)
+            pub async fn save_path(item_id: ItemId, workspace_id: WorkspaceId, path: PathBuf) -> Result<()> {
+                INSERT OR REPLACE INTO notebook_previews(item_id, workspace_id, path, alongside_source) VALUES (?, ?, ?, FALSE)
             }
         }
         query! {
-            pub fn get_path(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(PathBuf, bool)>> {
-                SELECT path, alongside_source FROM notebook_previews WHERE item_id = ? AND workspace_id = ?
+            pub fn get_path(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<PathBuf>> {
+                SELECT path FROM notebook_previews WHERE item_id = ? AND workspace_id = ?
             }
         }
     }

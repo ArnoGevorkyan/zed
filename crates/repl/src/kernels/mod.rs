@@ -105,6 +105,7 @@ pub fn start_kernel_tasks<S: KernelSession + 'static>(
 
     let (request_tx, mut request_rx) = futures::channel::mpsc::channel::<JupyterMessage>(100);
     let (stdin_tx, mut stdin_rx) = futures::channel::mpsc::channel::<JupyterMessage>(100);
+    let session = session.downgrade();
 
     let recv_task = cx.spawn({
         let session = session.clone();
@@ -188,12 +189,15 @@ pub fn start_kernel_tasks<S: KernelSession + 'static>(
             tasks.push(with_name("routing task", routing_task));
             tasks.push(with_name("stdin routing task", stdin_routing_task));
 
-            while let Some((name, result)) = tasks.next().await {
+            if let Some((name, result)) = tasks.next().await {
                 if let Err(err) = result {
-                    session.update(cx, |session, cx| {
-                        session.kernel_errored(format!("handling failed for {name}: {err}"), cx);
-                        cx.notify();
-                    });
+                    session
+                        .update(cx, |session, cx| {
+                            session
+                                .kernel_errored(format!("handling failed for {name}: {err}"), cx);
+                            cx.notify();
+                        })
+                        .ok();
                 }
             }
         }
@@ -204,6 +208,10 @@ pub fn start_kernel_tasks<S: KernelSession + 'static>(
 }
 
 pub trait KernelSession: Sized {
+    fn check_launch(&self, _cx: &mut Context<Self>) -> Result<()> {
+        Ok(())
+    }
+
     fn route(&mut self, message: &JupyterMessage, window: &mut Window, cx: &mut Context<Self>);
     fn kernel_errored(&mut self, error_message: String, cx: &mut Context<Self>);
 }
