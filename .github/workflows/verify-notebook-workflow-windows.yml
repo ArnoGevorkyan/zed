@@ -1,7 +1,7 @@
 name: Verify Python notebook workflow on Windows
 on:
   push:
-    branches: [capy/verify-notebook-workflow-f349827]
+    branches: [capy/verify-notebook-repair-3059d646]
 permissions:
   contents: read
 jobs:
@@ -19,16 +19,30 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          ref: f3498276d6065df4571b389424214fcc27bee214
+          ref: 3059d64663da7b0af2ff4a044d9f5dba60883752
           persist-credentials: false
       - name: Verify product revision
         shell: pwsh
         run: |
-          if ((git rev-parse HEAD) -ne 'f3498276d6065df4571b389424214fcc27bee214') { throw 'Unexpected checkout' }
+          if ((git rev-parse HEAD) -ne '3059d64663da7b0af2ff4a044d9f5dba60883752') { throw 'Unexpected checkout' }
           if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Requires standard hosted runner' }
           [Environment]::OSVersion.VersionString
           git log -1 --oneline
       - name: Test notebook source, trust, execution and saved plot
         run: cargo test --locked -p repl --lib
       - name: Install isolated Python and verify chart
-        run: cargo test --locked -p repl --lib install_and_reuse_a_working_notebook_kernel -- --ignored
+        shell: pwsh
+        run: |
+          cargo test --locked -p repl --lib install_and_reuse_a_working_notebook_kernel -- --ignored | Tee-Object -Variable result
+          if ($LASTEXITCODE -ne 0 -or -not ($result -match 'test result: ok\. 1 passed')) { throw 'Managed install and chart test did not pass' }
+      - name: Check sibling imports with a local Python kernel
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP 'notebook-repair-venv'
+          python -I -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the test environment' }
+          $env:ZED_NOTEBOOK_TEST_PYTHON = Join-Path $venv 'Scripts/python.exe'
+          & $env:ZED_NOTEBOOK_TEST_PYTHON -I -m pip --isolated install --only-binary=:all: --index-url https://pypi.org/simple 'ipykernel==7.4.0'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install the test kernel' }
+          cargo test --locked -p repl --lib notebook_kernel_imports_siblings_after_startup -- --ignored | Tee-Object -Variable result
+          if ($LASTEXITCODE -ne 0 -or -not ($result -match 'test result: ok\. 1 passed')) { throw 'Sibling import test did not pass' }
