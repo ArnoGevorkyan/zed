@@ -680,6 +680,13 @@ pub struct CodeCell {
 
 impl EventEmitter<CellEvent> for CodeCell {}
 
+pub(super) struct PreviousExecution {
+    source: String,
+    outputs: Vec<Output>,
+    count: Option<i32>,
+    duration: Option<Duration>,
+}
+
 impl CodeCell {
     pub(super) fn new(
         execution_count: Option<i32>,
@@ -785,7 +792,7 @@ impl CodeCell {
         !self.outputs.is_empty()
     }
 
-    fn has_stale_outputs(&self, cx: &App) -> bool {
+    pub(super) fn has_stale_outputs(&self, cx: &App) -> bool {
         (self.has_outputs() || self.execution_count.is_some())
             && self.current_source(cx) != self.source
     }
@@ -795,12 +802,30 @@ impl CodeCell {
         self.execution_duration = None;
     }
 
-    pub fn start_execution(&mut self, source: String) {
-        self.source = source;
-        self.clear_outputs();
-        self.execution_count = None;
+    pub(super) fn queue_execution(&mut self) {
+        self.is_executing = true;
+    }
+
+    pub(super) fn start_execution(&mut self, source: String) -> PreviousExecution {
         self.execution_start_time = Some(Instant::now());
         self.is_executing = true;
+        PreviousExecution {
+            source: std::mem::replace(&mut self.source, source),
+            outputs: std::mem::take(&mut self.outputs),
+            count: self.execution_count.take(),
+            duration: self.execution_duration.take(),
+        }
+    }
+
+    pub(super) fn cancel_execution(&mut self, previous: Option<PreviousExecution>) {
+        if let Some(previous) = previous {
+            self.source = previous.source;
+            self.outputs = previous.outputs;
+            self.execution_count = previous.count;
+            self.execution_duration = previous.duration;
+        }
+        self.execution_start_time = None;
+        self.is_executing = false;
     }
 
     pub fn finish_execution(&mut self) {
@@ -812,6 +837,21 @@ impl CodeCell {
 
     pub fn is_executing(&self) -> bool {
         self.is_executing
+    }
+
+    pub(super) fn update_display(
+        &mut self,
+        indices: &[usize],
+        data: &jupyter_protocol::Media,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for index in indices {
+            if let Some(output) = self.outputs.get_mut(*index) {
+                *output = Output::for_notebook(data, window, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// Displays a kernel-level failure (e.g. the kernel failed to launch because
@@ -1168,7 +1208,16 @@ impl Render for CodeCell {
                                                                 .text_color(
                                                                     cx.theme().colors().text_muted,
                                                                 )
-                                                                .child("Running..."),
+                                                                .child(
+                                                                    if self
+                                                                        .execution_start_time
+                                                                        .is_some()
+                                                                    {
+                                                                        "Running..."
+                                                                    } else {
+                                                                        "Queued..."
+                                                                    },
+                                                                ),
                                                         )
                                                         .into_any_element()
                                                 } else if let Some(duration_text) =

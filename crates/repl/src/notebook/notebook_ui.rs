@@ -1,7 +1,7 @@
 use std::{future::Future, sync::Arc};
 
 use super::{
-    Cell, CellEvent, CellPosition, MarkdownCellEvent, RenderableCell,
+    Cell, CellEvent, CellPosition, CodeCell, MarkdownCellEvent, RenderableCell, RunnableCell,
     document::{CellFields, ParsedNotebook},
 };
 use crate::kernels::{Kernel, KernelSession, LocalKernelSpecification, NativeRunningKernel};
@@ -66,6 +66,7 @@ pub struct NotebookEditor {
     kernel_task: Option<Shared<Task<()>>>,
     kernel_notice: Option<String>,
     execution_requests: HashMap<String, CellExecution>,
+    display_slots: HashMap<CellId, DisplaySlots>,
 }
 
 struct NotebookKernelSession(gpui::WeakEntity<NotebookEditor>);
@@ -76,6 +77,8 @@ struct CellRun {
     advance: bool,
 }
 
+type DisplaySlots = Vec<(String, usize)>;
+
 struct CellExecution {
     cell_id: CellId,
     source: String,
@@ -83,6 +86,7 @@ struct CellExecution {
     reply: Option<jupyter_protocol::ExecuteReply>,
     idle: bool,
     clear_on_output: bool,
+    previous: Option<(super::cell::PreviousExecution, DisplaySlots)>,
 }
 
 impl CellExecution {
@@ -94,7 +98,20 @@ impl CellExecution {
             reply: None,
             idle: false,
             clear_on_output: false,
+            previous: None,
         }
+    }
+
+    fn started(&self) -> bool {
+        self.previous.is_some()
+    }
+
+    fn queued(cell: &Entity<CodeCell>, source: String, cx: &mut App) -> Self {
+        cell.update(cx, |cell, cx| {
+            cell.queue_execution();
+            cx.notify();
+            Self::new(cell.id().clone(), source)
+        })
     }
 }
 
@@ -184,6 +201,7 @@ impl NotebookEditor {
             kernel: Kernel::Shutdown,
             kernel_specification: None,
             execution_requests: HashMap::default(),
+            display_slots: HashMap::default(),
             kernel_session: None,
             kernel_task: None,
             kernel_notice: None,
@@ -237,14 +255,16 @@ impl NotebookEditor {
         }
     }
 
-    fn stop_kernel(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn stop_kernel(&mut self, cx: &mut Context<Self>) {
         self.kernel_task.take();
         self.kernel_session = None;
         self.kernel = Kernel::Shutdown;
+        self.kernel_notice = None;
+        self.display_slots.clear();
         for (_, run) in self.execution_requests.drain() {
             if let Some(Cell::Code(cell)) = self.cell_map.get(&run.cell_id) {
                 cell.update(cx, |cell, cx| {
-                    cell.finish_execution();
+                    cell.cancel_execution(run.previous.map(|(previous, _)| previous));
                     cx.notify();
                 });
             }
@@ -641,14 +661,8 @@ impl NotebookEditor {
             .request_tx()
             .try_send(message)
             .map_err(|error| anyhow::anyhow!("Could not send code to the kernel: {error}"))?;
-        cell.update(cx, |cell, cx| {
-            cell.start_execution(run.source.clone());
-            cx.notify();
-        });
-        self.execution_requests.insert(
-            id,
-            CellExecution::new(run.cell_id.clone(), run.source.clone()),
-        );
+        self.execution_requests
+            .insert(id, CellExecution::queued(cell, run.source.clone(), cx));
         if run.advance && self.cell_order.get(self.selected_cell_index) == Some(&run.cell_id) {
             self.advance_in_command_mode(window, cx);
         }
@@ -1310,6 +1324,79 @@ impl KernelSession for NotebookKernelSession {
 }
 
 impl NotebookEditor {
+    fn update_display(
+        &mut self,
+        update: &jupyter_protocol::UpdateDisplayData,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let Some(id) = &update.transient.display_id else {
+            return Ok(());
+        };
+        self.check_execution(cx)?;
+        let data = serde_json::to_value(&update.data)?;
+        let metadata = serde_json::Value::Object(update.metadata.clone());
+        let targets: Vec<_> = self
+            .display_slots
+            .iter()
+            .filter_map(|(cell, slots)| {
+                let indices: Vec<_> = slots
+                    .iter()
+                    .filter(|(display, _)| display == id)
+                    .map(|(_, index)| *index)
+                    .collect();
+                (!indices.is_empty()).then(|| (cell.clone(), indices))
+            })
+            .collect();
+        for (cell_id, indices) in targets {
+            let Some(Cell::Code(cell)) = self.cell_map.get(&cell_id).cloned() else {
+                continue;
+            };
+            let replace = |outputs: &mut [serde_json::Value]| -> Result<()> {
+                for index in &indices {
+                    let output = outputs
+                        .get_mut(*index)
+                        .context("Displayed output no longer exists")?;
+                    output["data"] = data.clone();
+                    output["metadata"] = metadata.clone();
+                }
+                Ok(())
+            };
+            if let Some(run) = self
+                .execution_requests
+                .values_mut()
+                .find(|run| run.cell_id == cell_id && run.started())
+            {
+                replace(&mut run.outputs)?;
+            } else {
+                if cell.read(cx).has_stale_outputs(cx) {
+                    continue;
+                }
+                let index = self
+                    .cell_order
+                    .iter()
+                    .position(|id| *id == cell_id)
+                    .context("Displayed cell no longer exists")?;
+                let buffer = self.notebook_item.read(cx).buffer.read(cx).snapshot();
+                self.patch_cell(index, cx, |fields| {
+                    let range = &fields
+                        .execution
+                        .as_ref()
+                        .context("Only code cells have output")?
+                        .outputs;
+                    let text: String = buffer.text_for_range(range.clone()).collect();
+                    let mut outputs: Vec<serde_json::Value> = serde_json::from_str(&text)?;
+                    replace(&mut outputs)?;
+                    Ok(vec![(range.clone(), serde_json::to_string(&outputs)?)])
+                })?;
+            }
+            cell.update(cx, |cell, cx| {
+                cell.update_display(&indices, &update.data, window, cx)
+            });
+        }
+        Ok(())
+    }
+
     fn route_message(
         &mut self,
         message: &JupyterMessage,
@@ -1318,6 +1405,9 @@ impl NotebookEditor {
     ) -> Result<()> {
         if let JupyterMessageContent::Status(status) = &message.content {
             self.kernel.set_execution_state(&status.execution_state);
+        }
+        if let JupyterMessageContent::UpdateDisplayData(update) = &message.content {
+            return self.update_display(update, window, cx);
         }
         let Some(id) = message.parent_header.as_ref().map(|header| &header.msg_id) else {
             return Ok(());
@@ -1328,6 +1418,30 @@ impl NotebookEditor {
         let Some(Cell::Code(cell)) = self.cell_map.get(&run.cell_id).cloned() else {
             return Ok(());
         };
+        if !run.started()
+            && match &message.content {
+                JupyterMessageContent::ExecuteInput(_)
+                | JupyterMessageContent::ClearOutput(_)
+                | JupyterMessageContent::StreamContent(_)
+                | JupyterMessageContent::DisplayData(_)
+                | JupyterMessageContent::ExecuteResult(_)
+                | JupyterMessageContent::ErrorOutput(_) => true,
+                JupyterMessageContent::ExecuteReply(reply) => {
+                    reply.status != jupyter_protocol::ReplyStatus::Aborted
+                }
+                _ => false,
+            }
+        {
+            let previous = cell.update(cx, |cell, cx| {
+                let previous = cell.start_execution(run.source.clone());
+                cx.notify();
+                previous
+            });
+            run.previous = Some((
+                previous,
+                self.display_slots.remove(&run.cell_id).unwrap_or_default(),
+            ));
+        }
         match &message.content {
             JupyterMessageContent::Status(status) => {
                 if status.execution_state == jupyter_protocol::ExecutionState::Idle {
@@ -1340,6 +1454,7 @@ impl NotebookEditor {
             JupyterMessageContent::ClearOutput(clear) => {
                 run.clear_on_output = clear.wait;
                 if !clear.wait {
+                    self.display_slots.remove(&run.cell_id);
                     run.outputs.clear();
                     cell.update(cx, |cell, cx| {
                         cell.clear_outputs();
@@ -1356,11 +1471,21 @@ impl NotebookEditor {
             | JupyterMessageContent::ErrorOutput(_) => {
                 let mut output = serde_json::to_value(&message.content)?;
                 let fields = output.as_object_mut().context("Invalid kernel output")?;
-                fields.remove("transient");
+                let transient = fields.remove("transient");
                 fields.insert("output_type".into(), message.content.message_type().into());
                 let clear = std::mem::take(&mut run.clear_on_output);
                 if clear {
+                    self.display_slots.remove(&run.cell_id);
                     run.outputs.clear();
+                }
+                if let Some(id) = transient
+                    .as_ref()
+                    .and_then(|value| value["display_id"].as_str())
+                {
+                    self.display_slots
+                        .entry(run.cell_id.clone())
+                        .or_default()
+                        .push((id.to_owned(), run.outputs.len()));
                 }
                 run.outputs.push(output);
                 cell.update(cx, |cell, cx| {
@@ -1382,11 +1507,37 @@ impl NotebookEditor {
             .execution_requests
             .remove(id)
             .context("Cell execution not found")?;
-        let reply = run.reply.context("Missing kernel reply")?;
+        let result = self.commit_execution(&mut run, &cell, window, cx);
         cell.update(cx, |cell, cx| {
-            cell.finish_execution();
+            match &result {
+                Ok(count) => {
+                    cell.set_execution_count(*count);
+                    cell.finish_execution();
+                }
+                Err(_) => {
+                    let previous = run.previous.map(|(previous, slots)| {
+                        self.display_slots.remove(&run.cell_id);
+                        if !slots.is_empty() {
+                            self.display_slots.insert(run.cell_id, slots);
+                        }
+                        previous
+                    });
+                    cell.cancel_execution(previous);
+                }
+            }
             cx.notify();
         });
+        result.map(|_| ())
+    }
+
+    fn commit_execution(
+        &mut self,
+        run: &mut CellExecution,
+        cell: &Entity<CodeCell>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<i32> {
+        let reply = run.reply.take().context("Missing kernel reply")?;
         anyhow::ensure!(
             reply.status != jupyter_protocol::ReplyStatus::Aborted,
             "The kernel aborted this cell without executing it."
@@ -1397,7 +1548,7 @@ impl NotebookEditor {
             .iter()
             .position(|id| id == &run.cell_id)
             .context("Executed cell is no longer in the notebook")?;
-        let count = i64::try_from(reply.execution_count.0)?;
+        let count = i32::try_from(reply.execution_count.0)?;
         if reply.status == jupyter_protocol::ReplyStatus::Error
             && !run
                 .outputs
@@ -1417,7 +1568,8 @@ impl NotebookEditor {
                 cell.handle_message(&output.into(), window, cx)
             });
         }
-        self.persist_execution(index, &run.source, &run.outputs, Some(count), cx)
+        self.persist_execution(index, &run.source, &run.outputs, Some(i64::from(count)), cx)?;
+        Ok(count)
     }
 }
 
@@ -1640,6 +1792,101 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_aborted_and_stopped_cells_keep_previous_results(cx: &mut TestAppContext) {
+        let saved = json!({"output_type": "stream", "name": "stdout", "text": "saved\n"});
+        let notebook = json!({
+            "nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": [
+                {"id":"a", "cell_type":"code", "source":"raise ValueError()", "metadata":{},
+                 "execution_count":null, "outputs":[]},
+                {"id":"b", "cell_type":"code", "source":"print('partial')", "metadata":{},
+                 "execution_count":17, "outputs":[saved]}
+            ]
+        });
+        let (editor, cx) = kernel_test_editor(&notebook.to_string(), cx).await;
+        trust_notebook(&editor, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            let queue = |editor: &mut NotebookEditor, index, cx: &mut Context<NotebookEditor>| {
+                let Some(Cell::Code(cell)) = editor.cell(index).cloned() else {
+                    panic!("code cell")
+                };
+                let request: JupyterMessage = ExecuteRequest::default().into();
+                let run = CellExecution::queued(&cell, cell.read(cx).current_source(cx), cx);
+                editor
+                    .execution_requests
+                    .insert(request.header.msg_id.clone(), run);
+                (request, cell)
+            };
+            let (a, _) = queue(editor, 0, cx);
+            let (b, cell) = queue(editor, 1, cx);
+            let assert_visible_result = |text, count, cx: &App| {
+                let view = cell.read(cx);
+                assert_eq!(view.execution_count(), Some(count));
+                let [crate::outputs::Output::Stream { content }] = view.output_views() else {
+                    panic!("expected one stream")
+                };
+                assert_eq!(content.read(cx).full_text(cx), text);
+            };
+            assert_visible_result("saved\n", 17, cx);
+            for message in [
+                jupyter_protocol::ErrorOutput {
+                    ename: "ValueError".into(),
+                    ..Default::default()
+                }
+                .as_child_of(&a),
+                jupyter_protocol::ExecuteReply {
+                    status: jupyter_protocol::ReplyStatus::Error,
+                    execution_count: 1.into(),
+                    ..Default::default()
+                }
+                .as_child_of(&a),
+                jupyter_protocol::Status::idle().as_child_of(&a),
+                jupyter_protocol::Status::busy().as_child_of(&b),
+                jupyter_protocol::Status::idle().as_child_of(&b),
+            ] {
+                editor.route_message(&message, window, cx).unwrap();
+            }
+            let aborted = jupyter_protocol::ExecuteReply {
+                status: jupyter_protocol::ReplyStatus::Aborted,
+                ..Default::default()
+            }
+            .as_child_of(&b);
+            assert!(
+                editor
+                    .route_message(&aborted, window, cx)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("aborted")
+            );
+            assert_visible_result("saved\n", 17, cx);
+            assert!(!cell.read(cx).is_executing());
+            assert_eq!(cell.read(cx).execution_duration(), None);
+            let buffer = editor.notebook_item.read(cx).buffer.clone();
+            let after_abort = buffer.read(cx).text();
+            let doc: serde_json::Value = serde_json::from_str(&after_abort).unwrap();
+            assert_eq!(doc["cells"][0]["outputs"][0]["ename"], "ValueError");
+            assert_eq!(doc["cells"][1], notebook["cells"][1]);
+
+            let (rerun, _) = queue(editor, 1, cx);
+            for message in [
+                jupyter_protocol::ExecuteInput {
+                    execution_count: 2.into(),
+                    ..Default::default()
+                }
+                .as_child_of(&rerun),
+                jupyter_protocol::StreamContent::stdout("partial\n").as_child_of(&rerun),
+            ] {
+                editor.route_message(&message, window, cx).unwrap();
+            }
+            assert_visible_result("partial\n", 2, cx);
+            editor.stop_kernel(cx);
+            assert_visible_result("saved\n", 17, cx);
+            assert!(!cell.read(cx).is_executing());
+            assert_eq!(cell.read(cx).execution_duration(), None);
+            assert_eq!(buffer.read(cx).text(), after_abort);
+        });
+    }
+
+    #[gpui::test]
     async fn test_notebook_run_persists_matching_outputs_after_reply_and_idle(
         cx: &mut TestAppContext,
     ) {
@@ -1695,6 +1942,97 @@ mod tests {
                 value["cells"][0]["outputs"],
                 json!([{"output_type":"stream","name":"stdout","text":"from this request\n"}])
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_display_updates_replace_matching_slots_across_cells(cx: &mut TestAppContext) {
+        use jupyter_protocol::{
+            DisplayData, ExecuteReply, MediaType, Status, StreamContent, Transient,
+            UpdateDisplayData,
+        };
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(NOTEBOOK_WITH_ONE_CODE_CELL).unwrap();
+        let mut next = fixture["cells"][0].clone();
+        next["id"] = json!("second");
+        fixture["cells"].as_array_mut().unwrap().push(next);
+        let (editor, cx) = kernel_test_editor(&fixture.to_string(), cx).await;
+        trust_notebook(&editor, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            for index in 0..2 {
+                let request: JupyterMessage = ExecuteRequest::default().into();
+                let cell = editor.cell(index).unwrap();
+                editor.execution_requests.insert(request.header.msg_id.clone(), CellExecution::new(cell.id(cx), cell.current_source(cx)));
+                let original = DisplayData {
+                    data: vec![MediaType::Plain("initial".into())].into(),
+                    transient: Some(Transient { display_id: Some("figure".into()) }),
+                    ..Default::default()
+                };
+                let final_text = if index == 0 { "first update" } else { "final update" };
+                let mut update = UpdateDisplayData::new(vec![MediaType::Plain(final_text.into())].into(), "figure");
+                update.metadata.insert("phase".into(), json!(index));
+                for msg in [
+                    original.as_child_of(&request),
+                    StreamContent::stdout("untouched").as_child_of(&request),
+                    original.as_child_of(&request),
+                    update.as_child_of(&request),
+                    ExecuteReply { execution_count: (index + 1).into(), ..Default::default() }.as_child_of(&request),
+                    Status::idle().as_child_of(&request),
+                ] {
+                    editor.route_message(&msg, window, cx).unwrap();
+                }
+                let text = editor.notebook_item.read(cx).buffer.read(cx).text();
+                let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+                for target in 0..=index {
+                    let cell = &document["cells"][target];
+                    assert_eq!(cell["execution_count"], target + 1);
+                    assert_eq!(cell["outputs"][1]["text"], "untouched");
+                    let Some(Cell::Code(view)) = editor.cell(target) else { panic!("expected code cell") };
+                    for slot in [0, 2] {
+                        assert_eq!(cell["outputs"][slot], json!({"output_type": "display_data", "data": {"text/plain": final_text}, "metadata": {"phase": index}}));
+                        let crate::outputs::Output::Plain { content, .. } = &view.read(cx).output_views()[slot] else { panic!("expected plain output") };
+                        assert_eq!(content.read(cx).full_text(cx).trim_end(), final_text);
+                    }
+                }
+            }
+        });
+        let first = editor.read_with(cx, |editor, cx| {
+            editor.cell(0).unwrap().editor(cx).unwrap().clone()
+        });
+        first.update_in(cx, |editor, window, cx| {
+            editor.set_text("changed since execution", window, cx)
+        });
+        cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| {
+            let later =
+                UpdateDisplayData::new(vec![MediaType::Plain("later".into())].into(), "figure");
+            editor.route_message(&later.into(), window, cx).unwrap();
+            let text = editor.notebook_item.read(cx).buffer.read(cx).text();
+            let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+            for (index, expected) in ["final update", "later"].into_iter().enumerate() {
+                let saved = &document["cells"][index];
+                assert_eq!(saved["execution_count"], index + 1);
+                let Some(Cell::Code(view)) = editor.cell(index) else {
+                    panic!("expected code cell")
+                };
+                for slot in [0, 2] {
+                    assert_eq!(saved["outputs"][slot]["data"]["text/plain"], expected);
+                    let crate::outputs::Output::Plain { content, .. } =
+                        &view.read(cx).output_views()[slot]
+                    else {
+                        panic!("expected plain output")
+                    };
+                    assert_eq!(content.read(cx).full_text(cx).trim_end(), expected);
+                }
+            }
+            editor.stop_kernel(cx);
+            let before = editor.notebook_item.read(cx).buffer.read(cx).text();
+            let late = UpdateDisplayData::new(
+                vec![MediaType::Plain("old kernel".into())].into(),
+                "figure",
+            );
+            editor.route_message(&late.into(), window, cx).unwrap();
+            assert_eq!(editor.notebook_item.read(cx).buffer.read(cx).text(), before);
         });
     }
 
