@@ -1,0 +1,100 @@
+name: Verify notebook preview on Windows
+on:
+  push:
+    branches: [capy/verify-notebook-windows-2f76bde]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'ArnoGevorkyan/zed'
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: '0'
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: 2f76bde61277f95969a8cb129c6ad4593080a8f7
+          persist-credentials: false
+      - name: Verify product commit and Windows host
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne '2f76bde61277f95969a8cb129c6ad4593080a8f7') { throw 'Wrong revision' }
+          git show -s --format='%H %s'
+          [Environment]::OSVersion.VersionString
+          rustc -Vv
+          Get-PSDrive -PSProvider FileSystem
+      - name: Test native notebook and source-editor behavior
+        shell: pwsh
+        run: |
+          cargo test --locked -p repl --lib notebook::preview::preview_tests:: -- --nocapture 2>&1 | Tee-Object "$env:RUNNER_TEMP/notebook-tests.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Select-String -Quiet -SimpleMatch '2 passed; 0 failed' "$env:RUNNER_TEMP/notebook-tests.txt")) { throw 'Expected both preview tests to run' }
+      - name: Build the Windows editor
+        shell: pwsh
+        run: cargo build --locked -p zed --bin zed
+      - name: Capture the actual editor window on the hosted machine
+        shell: pwsh
+        env:
+          ZED_DISABLE_STAFF: '1'
+        run: |
+          $dir = New-Item -ItemType Directory "$env:RUNNER_TEMP/notebook-smoke"
+          $file = Join-Path $dir 'cells.ipynb'
+          '{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"markdown","id":"heading","metadata":{},"source":["# Notebook smoke test"]},{"cell_type":"code","id":"example","metadata":{},"source":["print(6 * 7)"],"execution_count":null,"outputs":[]}]}' | Set-Content -Encoding utf8NoBOM $file
+          $before = (Get-FileHash $file).Hash
+          $editor = Start-Process ./target/debug/zed.exe -ArgumentList @('--user-data-dir', "$env:RUNNER_TEMP/notebook-profile", $file) -PassThru
+          try {
+            Add-Type -AssemblyName System.Drawing
+            Add-Type -AssemblyName System.Windows.Forms
+            Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class NotebookWindow {
+              [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
+              [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out Rect bounds);
+              [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+              [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+          }
+          '@
+            for ($i=0; $i -lt 60; $i++) {
+              $editor.Refresh()
+              if ($editor.HasExited) { throw "Zed exited ($($editor.ExitCode)) before opening a window" }
+              if ($editor.MainWindowHandle -ne 0) { break }
+              Start-Sleep -Seconds 1
+            }
+            $window = $editor.MainWindowHandle
+            if ($window -eq 0) { throw 'No Zed window available for GUI evidence' }
+            [NotebookWindow]::SetForegroundWindow($window) | Out-Null
+            Start-Sleep -Seconds 3
+            if ([NotebookWindow]::GetForegroundWindow() -ne $window) { throw 'Cannot verify foreground Zed window' }
+            [System.Windows.Forms.SendKeys]::SendWait('^%+s')
+            Start-Sleep -Seconds 3
+            if ([NotebookWindow]::GetForegroundWindow() -ne $window) { throw 'Zed lost foreground' }
+            $rect = New-Object NotebookWindow+Rect
+            if (![NotebookWindow]::GetWindowRect($window,[ref]$rect)) { throw 'Missing Zed window bounds' }
+            $image = New-Object Drawing.Bitmap(($rect.Right-$rect.Left),($rect.Bottom-$rect.Top))
+            $graphics = [Drawing.Graphics]::FromImage($image)
+            $graphics.CopyFromScreen($rect.Left,$rect.Top,0,0,$image.Size)
+            $image.Save("$env:RUNNER_TEMP/notebook-window.png")
+            $graphics.Dispose()
+            $image.Dispose()
+            if ((Get-FileHash $file).Hash -ne $before) { throw 'Opening the notebook changed it' }
+          } finally {
+            if (!$editor.HasExited) { $editor.CloseMainWindow() | Out-Null }
+          }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: notebook-windows-evidence
+          path: |
+            ${{ runner.temp }}/notebook-tests.txt
+            ${{ runner.temp }}/notebook-window.png
+          if-no-files-found: ignore
+          retention-days: 7
