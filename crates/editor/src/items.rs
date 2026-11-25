@@ -1218,16 +1218,12 @@ impl Item for Editor {
             .and_then(|buffer| buffer.read(cx).language())
             .is_some_and(|language| language.name().as_ref() == "Markdown");
 
-        let is_svg = self
+        let file_extension = self
             .buffer()
             .read(cx)
             .as_singleton()
             .and_then(|buffer| buffer.read(cx).file())
-            .is_some_and(|file| {
-                std::path::Path::new(file.file_name(cx))
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
-            });
+            .and_then(|file| Path::new(file.file_name(cx)).extension());
 
         if is_markdown {
             actions.push((
@@ -1236,10 +1232,17 @@ impl Item for Editor {
             ));
         }
 
-        if is_svg {
+        if file_extension.is_some_and(|ext| ext.eq_ignore_ascii_case("svg")) {
             actions.push((
                 "Open SVG Preview".into(),
                 Box::new(OpenSvgPreview) as Box<dyn gpui::Action>,
+            ));
+        }
+
+        if file_extension.is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb")) {
+            actions.push((
+                "Open Notebook Preview".into(),
+                Box::new(zed_actions::notebook::OpenNotebook),
             ));
         }
 

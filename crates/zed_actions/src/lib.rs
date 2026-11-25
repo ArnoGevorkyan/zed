@@ -944,8 +944,10 @@ pub mod notebook {
     actions!(
         notebook,
         [
-            /// Opens a Jupyter notebook file.
+            /// Opens the current Jupyter notebook as a cell preview.
             OpenNotebook,
+            /// Returns to the notebook's JSON source.
+            EditSource,
             /// Runs all cells in the notebook.
             RunAll,
             /// Runs the current cell and stays on it.
