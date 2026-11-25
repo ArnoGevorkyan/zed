@@ -91,6 +91,83 @@ pub(in crate::notebook) async fn open_file(
 }
 
 #[gpui::test]
+async fn opening_a_notebook_at_a_position_reveals_its_source(cx: &mut TestAppContext) {
+    use util::paths::PathWithPosition;
+    use workspace::path_link::{OpenTarget, OpenTargetFoundBy};
+
+    let (_, workspace, cx) =
+        notebook_workspace(json!({"field.ipynb": NOTEBOOK, "field.json": NOTEBOOK}), cx).await;
+    for (file, already_open, row, column) in [
+        ("field.json", false, 9, 5),
+        ("field.ipynb", false, 9, 5),
+        ("field.ipynb", true, 9, 5),
+        ("field.ipynb", false, 1, 1),
+        ("field.ipynb", true, 1, 1),
+    ] {
+        let returned_item = if already_open {
+            open_file(file, &workspace, cx).await;
+            Some(workspace.update_in(cx, |workspace, window, cx| {
+                let preview = workspace
+                    .active_item_as::<NotebookPreview>(cx)
+                    .expect("ordinary open shows cells");
+                editor::items::navigate_to_file_position(
+                    &preview,
+                    row,
+                    Some(column),
+                    true,
+                    window,
+                    cx,
+                )
+                .item_id()
+            }))
+        } else {
+            let target = OpenTarget::Path(
+                PathWithPosition {
+                    path: Path::new(path!("/notebooks")).join(file),
+                    row: Some(row),
+                    column: Some(column),
+                },
+                false,
+                OpenTargetFoundBy::BackgroundPathResolution,
+            );
+            assert!(
+                workspace
+                    .update_in(cx, |_, window, cx| {
+                        cx.spawn_in(window, async move |workspace, cx| {
+                            editor::items::open_resolved_target(&workspace, &target, cx).await
+                        })
+                    })
+                    .await
+                    .unwrap()
+            );
+            None
+        };
+        cx.run_until_parked();
+        let source = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .unwrap()
+                .downcast::<Editor>()
+                .expect("source editor")
+        });
+        if let Some(returned_item) = returned_item {
+            assert_eq!(returned_item, source.entity_id());
+        }
+        source.update(cx, |editor, cx| {
+            let point = editor
+                .selections
+                .newest::<language::Point>(&editor.display_snapshot(cx))
+                .head();
+            assert_eq!(point, language::Point::new(row - 1, column - 1));
+            assert_eq!(editor.text(cx), NOTEBOOK);
+        });
+        drop(source);
+        cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
 async fn test_notebook_preview_keeps_the_original_source(cx: &mut TestAppContext) {
     let (fs, workspace, cx) = notebook_workspace(json!({"field.ipynb": NOTEBOOK}), cx).await;
     open_file("field.ipynb", &workspace, cx).await;

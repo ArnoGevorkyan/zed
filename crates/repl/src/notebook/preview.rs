@@ -1,5 +1,6 @@
 use anyhow::{Context as _, Result};
 use collections::HashSet;
+use editor::items::SourceLocationRequested;
 use editor::{Editor, EditorEvent};
 
 use gpui::{App, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global, Task, WeakEntity};
@@ -103,8 +104,13 @@ impl NotebookPreview {
             return;
         };
         let version = buffer.read(cx).version();
+        let pending_navigation =
+            cx.subscribe(&editor, |_, editor, _: &SourceLocationRequested, cx| {
+                SourceBuffers::remember(&editor, cx);
+            });
         cx.spawn_in(window, async move |workspace, cx| {
             let cells = parse.await;
+            drop(pending_navigation);
             workspace.update_in(cx, |workspace, window, cx| {
                 let dirty = editor.is_dirty(cx);
                 if workspace.pane_for_item_id(editor.entity_id()).as_ref() != Some(&pane)
@@ -171,6 +177,14 @@ impl NotebookPreview {
             }
             Some(cx.new(|cx| NotebookEditor::new(project, item, window, cx)))
         });
+        cx.subscribe_in(
+            &editor,
+            window,
+            |this, _, _: &SourceLocationRequested, window, cx| {
+                this.show_source(false, window, cx);
+            },
+        )
+        .detach();
         cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
             Editor::to_item_events(event, &mut |event| cx.emit(event));
             let external_edit = matches!(event, EditorEvent::BufferEdited)
@@ -291,6 +305,15 @@ impl Focusable for NotebookPreview {
 
 impl Item for NotebookPreview {
     type Event = ItemEvent;
+
+    fn reveal_source(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Box<dyn ItemHandle> {
+        self.show_source(false, window, cx);
+        Box::new(self.editor.clone())
+    }
 
     fn to_item_events(event: &ItemEvent, f: &mut dyn FnMut(ItemEvent)) {
         f(*event);

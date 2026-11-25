@@ -217,6 +217,13 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     fn discarded(&self, _project: Entity<Project>, _window: &mut Window, _cx: &mut Context<Self>) {}
     fn on_removed(&self, _cx: &mut Context<Self>) {}
     fn workspace_deactivated(&mut self, _window: &mut Window, _: &mut Context<Self>) {}
+    fn reveal_source(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Box<dyn ItemHandle> {
+        Box::new(cx.entity())
+    }
     fn pane_changed(&mut self, _new_pane_id: EntityId, _cx: &mut Context<Self>) {}
     fn navigate(
         &mut self,
@@ -524,6 +531,7 @@ pub trait ItemHandle: 'static + Send {
     fn deactivated(&self, window: &mut Window, cx: &mut App);
     fn on_removed(&self, cx: &mut App);
     fn workspace_deactivated(&self, window: &mut Window, cx: &mut App);
+    fn reveal_source(&self, window: &mut Window, cx: &mut App) -> Box<dyn ItemHandle>;
     fn navigate(&self, data: Arc<dyn Any + Send>, window: &mut Window, cx: &mut App) -> bool;
     fn item_id(&self) -> EntityId;
     fn to_any_view(&self) -> AnyView;
@@ -1039,6 +1047,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn navigate(&self, data: Arc<dyn Any + Send>, window: &mut Window, cx: &mut App) -> bool {
         self.update(cx, |this, cx| this.navigate(data, window, cx))
+    }
+
+    fn reveal_source(&self, window: &mut Window, cx: &mut App) -> Box<dyn ItemHandle> {
+        self.update(cx, |this, cx| this.reveal_source(window, cx))
     }
 
     fn item_id(&self) -> EntityId {

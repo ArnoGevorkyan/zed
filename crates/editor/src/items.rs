@@ -74,6 +74,9 @@ use zed_actions::preview::{
 
 pub const MAX_TAB_TITLE_LEN: usize = 24;
 
+pub struct SourceLocationRequested;
+impl EventEmitter<SourceLocationRequested> for Editor {}
+
 impl FollowableItem for Editor {
     fn remote_id(&self) -> Option<ViewId> {
         self.remote_id
@@ -635,6 +638,15 @@ fn deserialize_anchor(anchor: proto::EditorAnchor, buffer: &MultiBufferSnapshot)
 
 impl Item for Editor {
     type Event = EditorEvent;
+
+    fn reveal_source(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Box<dyn workspace::item::ItemHandle> {
+        cx.emit(SourceLocationRequested);
+        Box::new(cx.entity())
+    }
 
     fn act_as_type<'a>(
         &'a self,
@@ -2189,6 +2201,35 @@ pub fn active_match_index(
     }
 }
 
+pub fn navigate_to_file_position(
+    item: &dyn workspace::item::ItemHandle,
+    row: u32,
+    column: Option<u32>,
+    record_nav_history: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Box<dyn workspace::item::ItemHandle> {
+    let source = item.reveal_source(window, cx);
+    let Some(editor) = source.downcast::<Editor>() else {
+        return source;
+    };
+    editor.update(cx, |editor, cx| {
+        let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+            return;
+        };
+        let point = buffer.read(cx).snapshot().point_from_external_input(
+            row.saturating_sub(1),
+            column.unwrap_or(1).saturating_sub(1),
+        );
+        if record_nav_history {
+            editor.go_to_singleton_buffer_point(point, window, cx);
+        } else {
+            editor.go_to_singleton_buffer_point_silently(point, window, cx);
+        }
+    });
+    source
+}
+
 /// Opens a path-like target (e.g. `items.rs:100:5`) in the workspace, moving the cursor
 /// to the one-based row/column if present. Returns whether the target was opened.
 pub async fn open_resolved_target(
@@ -2228,22 +2269,17 @@ pub async fn open_resolved_target(
         };
         let opened_item =
             opened_item.with_context(|| format!("opening {:?}", path_to_open.path))?;
-        if let Some(row) = path_to_open.row
-            && let Some(editor) = opened_item.downcast::<Editor>()
-        {
-            let column = path_to_open.column.unwrap_or(0);
-            editor
-                .downgrade()
-                .update_in(cx, |editor, window, cx| {
-                    if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
-                        let point = buffer.read(cx).snapshot().point_from_external_input(
-                            row.saturating_sub(1),
-                            column.saturating_sub(1),
-                        );
-                        editor.go_to_singleton_buffer_point(point, window, cx);
-                    }
-                })
-                .log_err();
+        if let Some(row) = path_to_open.row {
+            cx.update(|window, cx| {
+                navigate_to_file_position(
+                    opened_item.as_ref(),
+                    row,
+                    path_to_open.column,
+                    true,
+                    window,
+                    cx,
+                )
+            })?;
         }
         Ok(true)
     } else if open_target.is_dir() {
