@@ -14,7 +14,7 @@ use super::{NotebookEditor, NotebookItem};
 
 #[cfg(test)]
 #[path = "preview_tests.rs"]
-mod preview_tests;
+pub(super) mod preview_tests;
 
 #[derive(Default)]
 struct SourceEditors(HashSet<EntityId>);
@@ -24,7 +24,7 @@ pub struct NotebookPreview {
     workspace: WeakEntity<Workspace>,
     editor: Entity<Editor>,
     focus_handle: FocusHandle,
-    notebook: Option<Entity<NotebookEditor>>,
+    pub(super) notebook: Option<Entity<NotebookEditor>>,
     restore_source: bool,
 }
 

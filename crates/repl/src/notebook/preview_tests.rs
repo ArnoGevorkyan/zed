@@ -30,7 +30,7 @@ const NOTEBOOK: &str = r##"{
 }
 "##;
 
-async fn notebook_workspace(
+pub(in crate::notebook) async fn notebook_workspace(
     files: Value,
     cx: &mut TestAppContext,
 ) -> (Arc<FakeFs>, Entity<Workspace>, &mut VisualTestContext) {
@@ -68,7 +68,11 @@ async fn notebook_workspace(
     (fs, workspace, cx)
 }
 
-async fn open_file(name: &str, workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+pub(in crate::notebook) async fn open_file(
+    name: &str,
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) {
     workspace
         .update_in(cx, |workspace, window, cx| {
             let worktree_id = workspace

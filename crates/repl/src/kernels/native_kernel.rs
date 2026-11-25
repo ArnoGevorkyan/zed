@@ -539,26 +539,23 @@ pub(crate) async fn notebook_python_kernels(
 pub(crate) async fn suitable_notebook_python_kernels(
     candidates: Vec<LocalKernelSpecification>,
     preferred: Option<&std::path::Path>,
-) -> Result<Vec<LocalKernelSpecification>> {
+) -> (Vec<LocalKernelSpecification>, Option<String>) {
     let mut specs = Vec::new();
-    let mut failure = None;
+    let mut failures = Vec::new();
     for candidate in candidates {
         match has_ipykernel(&candidate.path).await {
-            Ok(true) if preferred == Some(candidate.path.as_path()) => return Ok(vec![candidate]),
+            Ok(true) if preferred == Some(candidate.path.as_path()) => {
+                return (vec![candidate], None);
+            }
             Ok(true) => specs.push(candidate),
             Ok(false) => {}
             Err(error) => {
                 log::warn!("{error:#}");
-                failure = Some(error);
+                failures.push(format!("{error:#}"));
             }
         }
     }
-    if specs.is_empty()
-        && let Some(error) = failure
-    {
-        return Err(error);
-    }
-    Ok(specs)
+    (specs, (!failures.is_empty()).then(|| failures.join("\n")))
 }
 
 async fn has_ipykernel(path: &std::path::Path) -> Result<bool> {
@@ -628,9 +625,7 @@ mod test {
             )
             .unwrap(),
         );
-        let kernels = suitable_notebook_python_kernels(candidates, Some(&python))
-            .await
-            .unwrap();
+        let (kernels, _) = suitable_notebook_python_kernels(candidates, Some(&python)).await;
         assert!(
             marker.is_file(),
             "Run checks whether the project interpreter has ipykernel"

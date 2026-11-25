@@ -70,6 +70,12 @@ pub struct NotebookEditor {
 
 struct NotebookKernelSession(gpui::WeakEntity<NotebookEditor>);
 
+struct CellRun {
+    cell_id: CellId,
+    source: String,
+    advance: bool,
+}
+
 struct CellExecution {
     cell_id: CellId,
     source: String,
@@ -77,6 +83,19 @@ struct CellExecution {
     reply: Option<jupyter_protocol::ExecuteReply>,
     idle: bool,
     clear_on_output: bool,
+}
+
+impl CellExecution {
+    fn new(cell_id: CellId, source: String) -> Self {
+        Self {
+            cell_id,
+            source,
+            outputs: Vec::new(),
+            reply: None,
+            idle: false,
+            clear_on_output: false,
+        }
+    }
 }
 
 impl NotebookEditor {
@@ -110,7 +129,7 @@ impl NotebookEditor {
                     cx.subscribe_in(code_cell, window, move |this, _cell, event, window, cx| {
                         match event {
                             CellEvent::Run(cell_id) => {
-                                this.execute_cell(cell_id.clone(), window, cx);
+                                this.execute_cell(cell_id.clone(), false, window, cx);
                             }
                             CellEvent::FocusedIn(_) => {
                                 this.select_cell_by_id(&cell_id_for_focus, cx)
@@ -350,123 +369,192 @@ impl NotebookEditor {
 
     fn choose_or_start_kernel(
         &mut self,
-        run: Option<(CellId, String)>,
+        run: Option<CellRun>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) {
         if let Err(error) = self.check_execution(cx) {
             self.kernel_notice = Some(error.to_string());
             cx.notify();
-            return false;
+            return;
         }
         if self.kernel_task.is_some() {
             self.kernel_notice = Some("Kernel setup is in progress. This cell was not queued; run it again when the kernel is ready.".into());
             cx.notify();
-            return false;
+            return;
         }
         let selected = run.as_ref().and(self.kernel_specification.clone());
         let fs = self.project.read(cx).fs().clone();
         self.kernel_notice = Some("Finding a Python kernel…".into());
         let prepare = cx.spawn_in(window, async move |this, cx| {
-            let result: Result<()> = async {
-                let check = |editor: &Self, cx: &mut App| -> Result<()> {
-                    editor.check_execution(cx)?;
-                    if let Some((cell_id, source)) = &run {
-                        anyhow::ensure!(editor.cell_map.get(cell_id).is_some_and(|cell| cell.current_source(cx) == *source),
-                            "The cell changed. Run it again to execute its current source.");
-                    }
-                    Ok(())
-                };
-                let spec = if let Some(spec) = selected {
-                    spec
-                } else {
-                    let project_python = this.update(cx, |editor, cx| {
-                        check(editor, cx)?;
-                        editor.project_python(run.is_some(), cx)
-                    })??.await;
-                    let mut specs = cx.background_spawn(crate::kernels::notebook_python_kernels(fs, project_python.clone())).await?;
-                    this.update(cx, |editor, cx| check(editor, cx))??;
-                    if run.is_some() {
-                        specs = cx.background_spawn(async move {
-                            crate::kernels::suitable_notebook_python_kernels(specs, project_python.as_deref()).await
-                        }).await?;
-                    }
-                    this.update(cx, |editor, cx| check(editor, cx))??;
-                    if specs.is_empty() {
-                        anyhow::ensure!(run.is_some(), "No Python kernel found. Run a cell to set up Python for Zed.");
-                        let consent = cx.update(|window, cx| window.prompt(
-                            gpui::PromptLevel::Info, "Set up Python for notebooks?",
-                            Some("No local Python kernel was found. Zed can download a private Python environment with ipykernel and matplotlib for running cells and basic plots. Your project's Python environment will not change."),
-                            &["Set Up Python", "Cancel"], cx))?;
-                        if consent.await.ok() != Some(0) {
-                            anyhow::bail!("Python setup was canceled. Run a cell to try again.");
-                        }
-                        let install = this.update(cx, |editor, cx| {
-                            check(editor, cx)?;
-                            editor.kernel_notice = Some("Setting up Python for notebooks…".into());
-                            cx.notify();
-                            anyhow::Ok(super::kernel_setup::install_python_kernel(cx))
-                        })??;
-                        let path = install.await?;
-                        LocalKernelSpecification::for_notebook_python(path, "Zed Python".into())?
-                    } else if run.is_some() && specs.len() == 1 {
-                        specs.remove(0)
-                    } else {
-                        let mut buttons: Vec<_> = specs.iter().map(|spec| gpui::PromptButton::new(
-                            format!("{} ({})", spec.name, spec.path.display())
-                        )).collect();
-                        buttons.push(gpui::PromptButton::cancel("Cancel"));
-                        let choice = cx.update(|window, cx| window.prompt(gpui::PromptLevel::Info,
-                            "Select a local Python kernel", Some("Selecting a kernel does not run a cell."), &buttons, cx))?.await?;
-                        if let Some(spec) = specs.get(choice) {
-                            this.update(cx, |editor, cx| {
-                                check(editor, cx)?;
-                                editor.select_kernel(spec.clone(), cx);
-                                anyhow::Ok(())
-                            })??;
-                        }
-                        return Ok(());
-                    }
-                };
-                let Some((cell_id, source)) = run.as_ref() else { return Ok(()) };
-                let launch = this.update_in(cx, |editor, window, cx| {
-                    check(editor, cx)?;
-                    let directory = editor.project.read(cx).absolute_path(
-                        &editor.notebook_item.read(cx).project_path, cx
-                    ).and_then(|path| path.parent().map(ToOwned::to_owned)).context("Cannot find notebook directory")?;
-                    let owner = cx.weak_entity();
-                    let session = cx.new(|_| NotebookKernelSession(owner));
-                    editor.kernel_session = Some(session.clone());
-                    editor.kernel_specification = Some(spec.clone());
-                    editor.kernel_notice = Some(format!("Starting {}…", spec.name));
-                    cx.notify();
-                    Ok::<_, anyhow::Error>(NativeRunningKernel::new(spec, session.entity_id(), directory,
-                        editor.project.read(cx).fs().clone(), session, window, cx))
-                })??;
-                let kernel = launch.await.context("the kernel failed to launch")?;
-                this.update_in(cx, |editor, window, cx| {
-                    check(editor, cx)?;
-                    editor.kernel = Kernel::RunningKernel(kernel);
-                    editor.dispatch_cell(cell_id.clone(), source.clone(), window, cx)
-                })??;
-                Ok(())
-            }.await;
+            let result = Self::prepare_kernel(&this, selected, fs, run.as_ref(), cx).await;
             this.update_in(cx, |editor, window, cx| {
                 editor.kernel_task = None;
                 editor.kernel_notice = result.err().map(|error| format!("{error:#}"));
-                if editor.kernel_session.take_if(|_| matches!(editor.kernel, Kernel::Shutdown)).is_some()
+                if editor
+                    .kernel_session
+                    .take_if(|_| matches!(editor.kernel, Kernel::Shutdown))
+                    .is_some()
                     && let Some(error) = &editor.kernel_notice
-                    && let Some((id, _)) = run
-                    && let Some(Cell::Code(cell)) = editor.cell_map.get(&id)
+                    && let Some(run) = run
+                    && let Some(Cell::Code(cell)) = editor.cell_map.get(&run.cell_id)
                 {
                     cell.update(cx, |cell, cx| cell.show_kernel_error(error, window, cx));
                 }
                 cx.notify();
-            }).ok();
+            })
+            .ok();
         });
         self.kernel_task = Some(prepare.shared());
         cx.notify();
-        true
+    }
+
+    async fn prepare_kernel(
+        this: &gpui::WeakEntity<Self>,
+        selected: Option<LocalKernelSpecification>,
+        fs: Arc<dyn project::Fs>,
+        run: Option<&CellRun>,
+        cx: &mut gpui::AsyncWindowContext,
+    ) -> Result<()> {
+        let check = |editor: &Self, cx: &mut App| -> Result<()> {
+            editor.check_execution(cx)?;
+            if let Some(run) = run {
+                anyhow::ensure!(
+                    editor
+                        .cell_map
+                        .get(&run.cell_id)
+                        .is_some_and(|cell| cell.current_source(cx) == run.source),
+                    "The cell changed. Run it again to execute its current source."
+                );
+            }
+            Ok(())
+        };
+        let (mut specs, preferred) = if let Some(spec) = selected {
+            (vec![spec], None)
+        } else {
+            let project_python = this
+                .update(cx, |editor, cx| {
+                    check(editor, cx)?;
+                    editor.project_python(run.is_some(), cx)
+                })??
+                .await;
+            let specs = cx
+                .background_spawn(crate::kernels::notebook_python_kernels(
+                    fs,
+                    project_python.clone(),
+                ))
+                .await?;
+            (specs, project_python)
+        };
+        let mut diagnostic = None;
+        if run.is_some() {
+            this.update(cx, |editor, cx| check(editor, cx))??;
+            (specs, diagnostic) = cx
+                .background_spawn(async move {
+                    crate::kernels::suitable_notebook_python_kernels(specs, preferred.as_deref())
+                        .await
+                })
+                .await;
+        }
+        this.update(cx, |editor, cx| check(editor, cx))??;
+        let spec = if specs.is_empty() {
+            anyhow::ensure!(
+                run.is_some(),
+                "No Python kernel found. Run a cell to set up Python for Zed."
+            );
+            let consent = this.update_in(cx, |editor, window, cx| {
+                    let reason = if let Some(selected) = editor.kernel_specification.take() {
+                        if let Some(error) = diagnostic {
+                            if let Some(run) = run
+                                && let Some(Cell::Code(cell)) = editor.cell_map.get(&run.cell_id) {
+                                cell.update(cx, |cell, cx| cell.show_kernel_error(&error, window, cx));
+                            }
+                            error
+                        } else {
+                            format!("ipykernel is not installed in {} ({}).", selected.name, selected.path.display())
+                        }
+                    } else {
+                        diagnostic.unwrap_or_else(|| "No local Python kernel was found.".into())
+                    };
+                    editor.kernel_notice = Some(reason.clone());
+                    cx.notify();
+                    window.prompt(gpui::PromptLevel::Info, "Set up Python for notebooks?",
+                        Some(&format!("{reason}\n\nZed can download a private Python environment with ipykernel and matplotlib for running cells and basic plots. Your project's Python environment will not change.")),
+                        &["Set Up Python", "Cancel"], cx)
+                })?;
+            if consent.await.ok() != Some(0) {
+                anyhow::bail!("Python setup was canceled. Run a cell to try again.");
+            }
+            let install = this.update(cx, |editor, cx| {
+                check(editor, cx)?;
+                editor.kernel_notice = Some("Setting up Python for notebooks…".into());
+                cx.notify();
+                anyhow::Ok(super::kernel_setup::install_python_kernel(cx))
+            })??;
+            let path = install.await?;
+            LocalKernelSpecification::for_notebook_python(path, "Zed Python".into())?
+        } else if run.is_some() && specs.len() == 1 {
+            specs.remove(0)
+        } else {
+            let mut buttons: Vec<_> = specs
+                .iter()
+                .map(|spec| {
+                    gpui::PromptButton::new(format!("{} ({})", spec.name, spec.path.display()))
+                })
+                .collect();
+            buttons.push(gpui::PromptButton::cancel("Cancel"));
+            let choice = cx
+                .update(|window, cx| {
+                    window.prompt(
+                        gpui::PromptLevel::Info,
+                        "Select a local Python kernel",
+                        Some("Selecting a kernel does not run a cell."),
+                        &buttons,
+                        cx,
+                    )
+                })?
+                .await?;
+            if let Some(spec) = specs.get(choice) {
+                this.update(cx, |editor, cx| {
+                    check(editor, cx)?;
+                    editor.select_kernel(spec.clone(), cx);
+                    anyhow::Ok(())
+                })??;
+            }
+            return Ok(());
+        };
+        let Some(run) = run else { return Ok(()) };
+        let launch = this.update_in(cx, |editor, window, cx| {
+            check(editor, cx)?;
+            let directory = editor
+                .project
+                .read(cx)
+                .absolute_path(&editor.notebook_item.read(cx).project_path, cx)
+                .and_then(|path| path.parent().map(ToOwned::to_owned))
+                .context("Cannot find notebook directory")?;
+            let owner = cx.weak_entity();
+            let session = cx.new(|_| NotebookKernelSession(owner));
+            editor.kernel_session = Some(session.clone());
+            editor.kernel_specification = Some(spec.clone());
+            editor.kernel_notice = Some(format!("Starting {}…", spec.name));
+            cx.notify();
+            Ok::<_, anyhow::Error>(NativeRunningKernel::new(
+                spec,
+                session.entity_id(),
+                directory,
+                editor.project.read(cx).fs().clone(),
+                session,
+                window,
+                cx,
+            ))
+        })??;
+        let kernel = launch.await.context("the kernel failed to launch")?;
+        this.update_in(cx, |editor, window, cx| {
+            check(editor, cx)?;
+            editor.kernel = Kernel::RunningKernel(kernel);
+            editor.dispatch_cell(run, window, cx)
+        })??;
+        Ok(())
     }
 
     fn select_kernel(&mut self, spec: LocalKernelSpecification, cx: &mut Context<Self>) {
@@ -502,38 +590,49 @@ impl NotebookEditor {
     fn execute_cell(
         &mut self,
         cell_id: CellId,
+        advance: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) {
         let Some(Cell::Code(cell)) = self.cell_map.get(&cell_id) else {
-            return false;
+            return;
         };
-        let source = cell.read(cx).current_source(cx);
+        let run = CellRun {
+            cell_id,
+            source: cell.read(cx).current_source(cx),
+            advance,
+        };
         if !matches!(self.kernel, Kernel::RunningKernel(_)) {
-            return self.choose_or_start_kernel(Some((cell_id, source)), window, cx);
+            self.choose_or_start_kernel(Some(run), window, cx);
+            return;
         }
-        let result = self.dispatch_cell(cell_id, source, window, cx);
+        let result = self.dispatch_cell(&run, window, cx);
         self.kernel_notice = result.err().map(|error| error.to_string());
         cx.notify();
-        self.kernel_notice.is_none()
     }
 
     fn dispatch_cell(
         &mut self,
-        cell_id: CellId,
-        source: String,
-        _window: &mut Window,
+        run: &CellRun,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
         self.check_execution(cx)?;
-        let Some(Cell::Code(cell)) = self.cell_map.get(&cell_id) else {
+        anyhow::ensure!(
+            !self
+                .execution_requests
+                .values()
+                .any(|execution| execution.cell_id == run.cell_id),
+            "This cell is already running."
+        );
+        let Some(Cell::Code(cell)) = self.cell_map.get(&run.cell_id) else {
             anyhow::bail!("Cell not found");
         };
         let Kernel::RunningKernel(kernel) = &self.kernel else {
             anyhow::bail!("Kernel is not running");
         };
         let message: JupyterMessage = ExecuteRequest {
-            code: source.clone(),
+            code: run.source.clone(),
             ..Default::default()
         }
         .into();
@@ -542,23 +641,17 @@ impl NotebookEditor {
             .request_tx()
             .try_send(message)
             .map_err(|error| anyhow::anyhow!("Could not send code to the kernel: {error}"))?;
-        self.execution_requests
-            .retain(|_, run| run.cell_id != cell_id);
         cell.update(cx, |cell, cx| {
-            cell.start_execution(source.clone());
+            cell.start_execution(run.source.clone());
             cx.notify();
         });
         self.execution_requests.insert(
             id,
-            CellExecution {
-                cell_id,
-                source,
-                outputs: vec![],
-                reply: None,
-                idle: false,
-                clear_on_output: false,
-            },
+            CellExecution::new(run.cell_id.clone(), run.source.clone()),
         );
+        if run.advance && self.cell_order.get(self.selected_cell_index) == Some(&run.cell_id) {
+            self.advance_in_command_mode(window, cx);
+        }
         cx.notify();
         Ok(())
     }
@@ -578,7 +671,7 @@ impl NotebookEditor {
         };
         match cell {
             Cell::Code(_) => {
-                self.execute_cell(cell_id, window, cx);
+                self.execute_cell(cell_id, false, window, cx);
             }
             Cell::Markdown(markdown_cell) => {
                 // for markdown, finish editing and move to next cell
@@ -599,9 +692,8 @@ impl NotebookEditor {
             if let Some(cell) = self.cell_map.get(&cell_id) {
                 match cell {
                     Cell::Code(_) => {
-                        if !self.execute_cell(cell_id, window, cx) {
-                            return;
-                        }
+                        self.execute_cell(cell_id, true, window, cx);
+                        return;
                     }
                     Cell::Markdown(markdown_cell) => {
                         if markdown_cell.read(cx).is_editing() {
@@ -1515,6 +1607,12 @@ mod tests {
                 .clone()
                 .expect("explicit run should start the kernel")
         });
+        cx.condition(&editor, |editor, _| editor.kernel_specification.is_none())
+            .await;
+        let (title, detail) = cx.pending_prompt().expect("setup offer");
+        assert_eq!(title, "Set up Python for notebooks?");
+        assert!(detail.contains("Could not check Python at"));
+        cx.simulate_prompt_answer("Cancel");
         launch.await;
         editor.read_with(cx, |editor, cx| {
             let Some(Cell::Code(cell)) = editor.cell(0) else {
@@ -1531,7 +1629,7 @@ mod tests {
                     .traceback
                     .read(cx)
                     .full_text(cx)
-                    .contains("the kernel failed to launch")
+                    .contains("Could not check Python at")
             );
             assert_eq!(
                 editor.notebook_item.read(cx).buffer.read(cx).text(),
@@ -1553,15 +1651,17 @@ mod tests {
             let source = editor.cell(0).unwrap().current_source(cx);
             editor.execution_requests.insert(
                 request.header.msg_id.clone(),
-                CellExecution {
-                    cell_id: id,
-                    source,
-                    outputs: vec![],
-                    reply: None,
-                    idle: false,
-                    clear_on_output: false,
-                },
+                CellExecution::new(id, source),
             );
+            let duplicate = CellRun {
+                cell_id: editor.cell_order[0].clone(),
+                source: editor.cell(0).unwrap().current_source(cx),
+                advance: true,
+            };
+            let error = editor
+                .dispatch_cell(&duplicate, window, cx)
+                .expect_err("duplicate run");
+            assert!(error.to_string().contains("already running"));
             let buffer = editor.notebook_item.read(cx).buffer.clone();
             let stream = jupyter_protocol::StreamContent::stdout("from this request\n");
             let reply = jupyter_protocol::ExecuteReply {
@@ -1598,6 +1698,130 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_save_and_reopen_a_kernel_chart(cx: &mut TestAppContext) {
+        use crate::notebook::{
+            NotebookPreview,
+            preview::preview_tests::{notebook_workspace, open_file},
+        };
+        use project::Fs as _;
+
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGP4DwABAQEAsTj2FAAAAABJRU5ErkJggg==";
+        let (fs, workspace, cx) =
+            notebook_workspace(json!({"chart.ipynb": NOTEBOOK_WITH_ONE_CODE_CELL}), cx).await;
+        open_file("chart.ipynb", &workspace, cx).await;
+        let active_notebook = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item_as::<NotebookPreview>(cx)
+                    .expect("notebook tab")
+                    .read(cx)
+                    .notebook
+                    .clone()
+                    .expect("cell editor")
+            })
+        };
+        let notebook = active_notebook(cx);
+        trust_notebook(&notebook, cx);
+        let data =
+            json!({"image/png": PNG, "text/plain": "Figure", "text/html": "<span>Figure</span>"});
+        notebook.update_in(cx, |editor, window, cx| {
+            let request: JupyterMessage = ExecuteRequest::default().into();
+            let cell = editor.cell(0).expect("code cell");
+            editor.execution_requests.insert(
+                request.header.msg_id.clone(),
+                CellExecution::new(cell.id(cx), cell.current_source(cx)),
+            );
+            let display = jupyter_protocol::DisplayData::new(
+                serde_json::from_value(data.clone()).expect("valid MIME bundle"),
+            );
+            let reply = jupyter_protocol::ExecuteReply {
+                execution_count: 3.into(),
+                ..Default::default()
+            };
+            for msg in [
+                display.as_child_of(&request),
+                jupyter_protocol::Status::idle().as_child_of(&request),
+                reply.as_child_of(&request),
+            ] {
+                editor
+                    .route_message(&msg, window, cx)
+                    .expect("route kernel result");
+            }
+        });
+        drop(notebook);
+        cx.dispatch_action(workspace::Save { save_intent: None });
+        cx.run_until_parked();
+        let bytes = fs
+            .load_bytes(std::path::Path::new(path!("/notebooks/chart.ipynb")))
+            .await
+            .expect("saved notebook");
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("valid notebook");
+        assert_eq!(saved["cells"][0]["execution_count"], 3);
+        assert_eq!(saved["cells"][0]["outputs"][0]["data"], data);
+        cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+        cx.run_until_parked();
+        open_file("chart.ipynb", &workspace, cx).await;
+        active_notebook(cx).read_with(cx, |editor, cx| {
+            assert!(matches!(editor.kernel, Kernel::Shutdown));
+            let Some(Cell::Code(cell)) = editor.cell(0) else {
+                panic!("expected a code cell")
+            };
+            assert!(matches!(
+                cell.read(cx).output_views(),
+                [crate::outputs::Output::Image { .. }]
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restricting_worktree_discards_in_flight_cell_output(cx: &mut TestAppContext) {
+        let (editor, cx) = kernel_test_editor(NOTEBOOK_WITH_ONE_CODE_CELL, cx).await;
+        trust_notebook(&editor, cx);
+        let request: JupyterMessage = ExecuteRequest::default().into();
+        editor.update_in(cx, |editor, window, cx| {
+            let cell = editor.cell(0).unwrap();
+            let run = CellExecution::new(cell.id(cx), cell.current_source(cx));
+            editor
+                .execution_requests
+                .insert(request.header.msg_id.clone(), run);
+            editor
+                .route_message(
+                    &jupyter_protocol::StreamContent::stdout("in flight").as_child_of(&request),
+                    window,
+                    cx,
+                )
+                .unwrap();
+            let store = editor.project.read(cx).worktree_store().downgrade();
+            let id = project::trusted_worktrees::PathTrust::Worktree(editor.worktree_id);
+            TrustedWorktrees::try_get_global(cx)
+                .unwrap()
+                .update(cx, |trust, cx| {
+                    trust.restrict(store, [id].into_iter().collect(), cx)
+                });
+        });
+        cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| {
+            for message in [
+                jupyter_protocol::Status::idle().as_child_of(&request),
+                jupyter_protocol::ExecuteReply::default().as_child_of(&request),
+            ] {
+                editor.route_message(&message, window, cx).unwrap();
+            }
+            assert!(
+                editor
+                    .kernel_notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Restricted Mode")
+            );
+            assert_eq!(
+                editor.notebook_item.read(cx).buffer.read(cx).text(),
+                NOTEBOOK_WITH_ONE_CODE_CELL
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_run_and_advance_during_kernel_setup_stays_on_cell(cx: &mut TestAppContext) {
         let mut value: serde_json::Value =
             serde_json::from_str(NOTEBOOK_WITH_ONE_CODE_CELL).unwrap();
@@ -1617,6 +1841,51 @@ mod tests {
                     .unwrap()
                     .contains("not queued")
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_selected_python_without_ipykernel_offers_setup_without_advancing(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let interpreter = root.path().join("python");
+        std::fs::write(&interpreter, "#!/bin/sh\nexit 77\n").unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(NOTEBOOK_WITH_ONE_CODE_CELL).unwrap();
+        let mut second = value["cells"][0].clone();
+        second["id"] = "second".into();
+        value["cells"].as_array_mut().unwrap().push(second);
+        let raw = value.to_string();
+        let (editor, cx) = kernel_test_editor(&raw, cx).await;
+        trust_notebook(&editor, cx);
+        cx.executor().allow_parking();
+        let run = editor.update_in(cx, |editor, window, cx| {
+            let spec =
+                LocalKernelSpecification::for_notebook_python(interpreter, "System Python".into())
+                    .unwrap();
+            editor.select_kernel(spec, cx);
+            editor.run_and_advance(&RunAndAdvance, window, cx);
+            assert_eq!(editor.selected_cell_index, 0, "setup is not execution");
+            editor.kernel_task.clone().unwrap()
+        });
+        cx.condition(&editor, |editor, _| editor.kernel_specification.is_none())
+            .await;
+        let (_, detail) = cx.pending_prompt().expect("consent before installing");
+        assert!(detail.contains("ipykernel is not installed in System Python"));
+        cx.simulate_prompt_answer("Cancel");
+        run.await;
+        editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.selected_cell_index, 0);
+            assert!(editor.kernel_session.is_none());
+            assert!(
+                editor.kernel_specification.is_none(),
+                "the next Run can rediscover a usable kernel"
+            );
+            assert_eq!(editor.notebook_item.read(cx).buffer.read(cx).text(), raw);
         });
     }
 
