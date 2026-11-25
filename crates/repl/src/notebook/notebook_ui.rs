@@ -69,6 +69,7 @@ pub(crate) const CONTROL_SIZE: f32 = 20.0;
 const NOTEBOOK_EXTENSION: &str = "ipynb";
 
 pub fn init(cx: &mut App) {
+    super::preview::init(cx);
     if cx.has_flag::<NotebookFeatureFlag>() || std::env::var("LOCAL_NOTEBOOK_DEV").is_ok() {
         workspace::register_project_item::<NotebookEditor>(cx);
     }
@@ -2028,7 +2029,9 @@ impl KernelSession for NotebookEditor {
     }
 }
 
-fn upgrade_notebook(notebook: nbformat::Notebook) -> anyhow::Result<nbformat::v4::Notebook> {
+pub(super) fn upgrade_notebook(
+    notebook: nbformat::Notebook,
+) -> anyhow::Result<nbformat::v4::Notebook> {
     match notebook {
         nbformat::Notebook::V4(notebook) => Ok(notebook),
         nbformat::Notebook::V4QuirksMode(notebook) => {
@@ -2036,7 +2039,16 @@ fn upgrade_notebook(notebook: nbformat::Notebook) -> anyhow::Result<nbformat::v4
             Ok(notebook.repair())
         }
         nbformat::Notebook::Legacy(notebook) => nbformat::upgrade_legacy_notebook(notebook),
-        nbformat::Notebook::V3(notebook) => nbformat::upgrade_v3_notebook(notebook),
+        nbformat::Notebook::V3(notebook) => {
+            for worksheet in notebook.worksheets.iter().flatten() {
+                for cell in &worksheet.cells {
+                    if let nbformat::v3::Cell::Heading { level, .. } = cell {
+                        anyhow::ensure!((1..=6).contains(level), "Invalid notebook heading level");
+                    }
+                }
+            }
+            nbformat::upgrade_v3_notebook(notebook)
+        }
         _ => anyhow::bail!("Unsupported notebook format"),
     }
 }
