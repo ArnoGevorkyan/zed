@@ -599,7 +599,12 @@ mod test {
         std::fs::create_dir_all(&kernel_dir)?;
         std::fs::write(
             kernel_dir.join("kernel.json"),
-            serde_json::to_vec(&spec.kernelspec)?,
+            serde_json::to_vec(&serde_json::json!({
+                "argv": spec.kernelspec.argv,
+                "env": spec.kernelspec.env,
+                "display_name": spec.kernelspec.display_name,
+                "language": spec.kernelspec.language,
+            }))?,
         )?;
         std::fs::write(root.path().join("sibling_module.py"), "RESULT = 42\n")?;
         let output = util::command::new_std_command(&spec.path)
