@@ -58,8 +58,9 @@ impl LocalKernelSpecification {
                         .context("Invalid Python interpreter path")?
                         .to_owned(),
                     "-I".into(),
-                    "-m".into(),
-                    "ipykernel_launcher".into(),
+                    "-c".into(),
+                    include_str!("notebook_launcher.py").into(),
+                    "--InteractiveShellApp.ignore_cwd=True".into(),
                     "-f".into(),
                     "{connection_file}".into(),
                 ],
@@ -585,6 +586,48 @@ mod test {
     use gpui::TestAppContext;
     use project::FakeFs;
     use serde_json::json;
+
+    #[test]
+    #[ignore = "requires ZED_NOTEBOOK_TEST_PYTHON pointing to a local interpreter with ipykernel"]
+    fn notebook_kernel_imports_siblings_after_startup() -> Result<()> {
+        let python =
+            env::var_os("ZED_NOTEBOOK_TEST_PYTHON").context("Set ZED_NOTEBOOK_TEST_PYTHON")?;
+        let spec =
+            LocalKernelSpecification::for_notebook_python(python.into(), "Test Python".into())?;
+        let root = tempfile::tempdir()?;
+        let kernel_dir = root.path().join("kernels/zed-test");
+        std::fs::create_dir_all(&kernel_dir)?;
+        std::fs::write(
+            kernel_dir.join("kernel.json"),
+            serde_json::to_vec(&spec.kernelspec)?,
+        )?;
+        std::fs::write(root.path().join("sibling_module.py"), "RESULT = 42\n")?;
+        let output = util::command::new_std_command(&spec.path)
+            .current_dir(root.path())
+            .env("JUPYTER_PATH", root.path())
+            .env("IPYTHONDIR", root.path().join("ipython"))
+            .args(["-I", "-c", r#"
+from jupyter_client.manager import run_kernel
+
+with run_kernel(kernel_name="zed-test") as client:
+    def execute(code, count, silent=False):
+        reply = client.execute_interactive(code, silent=silent, store_history=not silent, timeout=15)
+        assert reply["content"]["status"] == "ok", reply["content"]
+        assert reply["content"]["execution_count"] == count, reply["content"]
+
+    execute("import sys, importlib.util; assert importlib.util.find_spec('sibling_module') is None", 0, silent=True)
+    execute("%pwd\nfrom sibling_module import RESULT\nassert RESULT == 42", 1)
+    execute("sys.path.remove('')", 2)
+    execute("assert '' not in sys.path and RESULT == 42", 3)
+"#])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[gpui::test]
