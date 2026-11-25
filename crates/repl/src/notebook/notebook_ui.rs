@@ -1153,18 +1153,7 @@ impl project::ProjectItem for NotebookItem {
         let path = path.clone();
         let project = project.clone();
 
-        let is_notebook = project
-            .read(cx)
-            .absolute_path(&path, cx)
-            .as_ref()
-            .and_then(|path| path.extension())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case(NOTEBOOK_EXTENSION))
-            || path
-                .path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case(NOTEBOOK_EXTENSION));
-
-        if is_notebook {
+        if Self::supports_path(project.read(cx), &path, cx) {
             Some(cx.spawn(async move |cx| {
                 let buffer = project
                     .update(cx, |project, cx| project.open_buffer(path.clone(), cx))
@@ -1206,6 +1195,18 @@ impl project::ProjectItem for NotebookItem {
 }
 
 impl NotebookItem {
+    pub(super) fn supports_path(project: &Project, path: &ProjectPath, cx: &App) -> bool {
+        project
+            .absolute_path(path, cx)
+            .as_ref()
+            .and_then(|path| path.extension())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(NOTEBOOK_EXTENSION))
+            || path
+                .path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case(NOTEBOOK_EXTENSION))
+    }
+
     pub fn language_name(&self) -> Option<String> {
         self.notebook
             .metadata

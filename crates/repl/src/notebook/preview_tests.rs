@@ -260,6 +260,48 @@ async fn test_edit_and_save_cells_in_restricted_mode(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_splitting_notebook_source_keeps_both_editors(cx: &mut TestAppContext) {
+    let (_, workspace, cx) =
+        notebook_workspace(json!({"field.ipynb": NOTEBOOK, "notes.txt": "notes"}), cx).await;
+    open_file("notes.txt", &workspace, cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    cx.dispatch_action(EditSource);
+    cx.dispatch_action(workspace::pane::SplitRight::default());
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.panes().len(), 2);
+        for pane in workspace.panes() {
+            let editor = pane
+                .read(cx)
+                .active_item()
+                .expect("tab")
+                .downcast::<Editor>()
+                .expect("splitting notebook source should keep the JSON editor");
+            assert_eq!(editor.read(cx).text(cx), NOTEBOOK);
+        }
+    });
+    cx.dispatch_action(workspace::ActivatePane(0));
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    cx.dispatch_action(workspace::ActivatePane(1));
+    cx.dispatch_action(workspace::MoveItemToPane {
+        destination: 0,
+        focus: true,
+        clone: false,
+    });
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.panes().len(), 1);
+        let editor = workspace
+            .active_item_as::<Editor>(cx)
+            .expect("moved source editor");
+        assert_eq!(editor.read(cx).text(cx), NOTEBOOK);
+    });
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    open_file("field.ipynb", &workspace, cx).await;
+    assert!(workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<NotebookPreview>(cx).is_some()
+    }));
+}
+
+#[gpui::test]
 async fn test_unpreviewable_files_open_in_the_editor(cx: &mut TestAppContext) {
     let malformed = "{not valid JSON";
     let unsupported = r#"{"nbformat":99,"nbformat_minor":0,"cells":[],"metadata":{}}"#;

@@ -17,8 +17,21 @@ use super::{NotebookEditor, NotebookItem};
 pub(super) mod preview_tests;
 
 #[derive(Default)]
-struct SourceEditors(HashSet<EntityId>);
-impl Global for SourceEditors {}
+struct SourceBuffers(HashSet<EntityId>);
+impl Global for SourceBuffers {}
+
+impl SourceBuffers {
+    fn remember(editor: &Entity<Editor>, cx: &mut App) {
+        let buffer = editor.read(cx).buffer().clone();
+        let id = buffer.entity_id();
+        if cx.global_mut::<Self>().0.insert(id) {
+            cx.observe_release(&buffer, move |_, cx| {
+                cx.global_mut::<Self>().0.remove(&id);
+            })
+            .detach();
+        }
+    }
+}
 
 pub struct NotebookPreview {
     workspace: WeakEntity<Workspace>,
@@ -29,7 +42,7 @@ pub struct NotebookPreview {
 }
 
 pub(super) fn init(cx: &mut App) {
-    cx.default_global::<SourceEditors>();
+    cx.default_global::<SourceBuffers>();
     workspace::register_serializable_item::<NotebookPreview>(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
@@ -40,12 +53,6 @@ pub(super) fn init(cx: &mut App) {
             let Some(editor) = item.downcast::<Editor>() else {
                 return;
             };
-            if workspace.is_restoring()
-                || cx.global::<SourceEditors>().0.contains(&item.item_id())
-                || item.is_dirty(cx)
-            {
-                return;
-            }
             NotebookPreview::open(workspace, editor, false, window, cx);
         })
         .detach();
@@ -75,6 +82,19 @@ impl NotebookPreview {
         let Some(path) = editor.read(cx).active_project_path(cx) else {
             return;
         };
+        if !NotebookItem::supports_path(workspace.project().read(cx), &path, cx) {
+            return;
+        }
+        let source_id = editor.read(cx).buffer().entity_id();
+        if !explicit {
+            if workspace.is_restoring() || editor.is_dirty(cx) {
+                SourceBuffers::remember(&editor, cx);
+                return;
+            }
+            if cx.global::<SourceBuffers>().0.contains(&source_id) {
+                return;
+            }
+        }
         let Some(pane) = workspace.pane_for_item_id(editor.entity_id()) else {
             return;
         };
@@ -93,7 +113,7 @@ impl NotebookPreview {
                     || (!explicit
                         && (dirty
                             || workspace.is_restoring()
-                            || cx.global::<SourceEditors>().0.contains(&editor.entity_id())))
+                            || cx.global::<SourceBuffers>().0.contains(&source_id)))
                 {
                     return;
                 }
@@ -239,14 +259,8 @@ impl NotebookPreview {
                     .items_of_type::<Editor>()
                     .find(|item| item.read(cx).buffer().read(cx).as_singleton() == source_buffer)
                     .unwrap_or(editor);
-                let source_id = editor.entity_id();
-                if cx.global_mut::<SourceEditors>().0.insert(source_id) {
-                    App::observe_release(cx, &editor, move |_, cx| {
-                        cx.global_mut::<SourceEditors>().0.remove(&source_id);
-                    })
-                    .detach();
-                }
-                if workspace.pane_for_item_id(source_id).is_some() {
+                SourceBuffers::remember(&editor, cx);
+                if workspace.pane_for_item_id(editor.entity_id()).is_some() {
                     if explicit {
                         workspace.activate_item(&editor, true, true, window, cx);
                     }
