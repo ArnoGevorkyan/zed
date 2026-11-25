@@ -227,7 +227,7 @@ async fn test_notebook_preview_keeps_the_original_source(cx: &mut TestAppContext
         window.dispatch_action(action, cx);
     });
     cx.run_until_parked();
-    workspace.read_with(cx, |workspace, cx| {
+    let code = workspace.read_with(cx, |workspace, cx| {
         let preview = workspace
             .active_item_as::<NotebookPreview>(cx)
             .expect("notebook preview");
@@ -244,7 +244,22 @@ async fn test_notebook_preview_keeps_the_original_source(cx: &mut TestAppContext
                 .current_source(cx)
                 .contains("Unsaved notes")
         );
+        notebook
+            .read(cx)
+            .cell(1)
+            .unwrap()
+            .editor(cx)
+            .unwrap()
+            .clone()
     });
+    code.update_in(cx, |editor, window, cx| {
+        editor.set_text("modified", window, cx)
+    });
+    cx.run_until_parked();
+    code.update_in(cx, |editor, window, cx| {
+        editor.undo(&editor::actions::Undo, window, cx)
+    });
+    cx.run_until_parked();
     cx.dispatch_action(EditSource);
     workspace.read_with(cx, |workspace, cx| {
         let editor = workspace
@@ -474,6 +489,176 @@ async fn test_splitting_notebook_source_keeps_both_editors(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+async fn test_cell_source_undo_restores_the_saved_notebook(cx: &mut TestAppContext) {
+    let first_line = format!("value = '{}'", "x".repeat(1024));
+    let source = format!(r#"[ "{first_line}\r\n", "sample = \u00317" ]"#);
+    let mixed_markdown =
+        r##"["# Field notes\r\n", "Another line\n", "![sample](attachment:sample.png)"]"##;
+    let original = NOTEBOOK
+        .replace(
+            r##"["# Field notes\n", "![sample](attachment:sample.png)"]"##,
+            mixed_markdown,
+        )
+        .replace(r#"["print('from source')"]"#, &source);
+    let (_, workspace, cx) = notebook_workspace(json!({"field.ipynb": original}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    let view = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<NotebookPreview>(cx).unwrap()
+    });
+    let (raw, code, markdown) = view.read_with(cx, |view, cx| {
+        let notebook = view.notebook.as_ref().unwrap().read(cx);
+        (
+            view.editor.clone(),
+            notebook.cell(1).unwrap().editor(cx).unwrap().clone(),
+            notebook.cell(0).unwrap().editor(cx).unwrap().clone(),
+        )
+    });
+    let assert_source = |expected: &str, dirty, cx: &mut VisualTestContext| {
+        assert_eq!(raw.read_with(cx, |editor, cx| editor.text(cx)), expected);
+        assert_eq!(
+            view.read_with(cx, |view, cx| workspace::Item::is_dirty(view, cx)),
+            dirty
+        );
+    };
+    let undo = |cell: &Entity<Editor>, cx: &mut VisualTestContext| {
+        cell.update_in(cx, |editor, window, cx| {
+            editor.undo(&editor::actions::Undo, window, cx)
+        });
+        cx.run_until_parked();
+    };
+    let redo = |cell: &Entity<Editor>, cx: &mut VisualTestContext| {
+        cell.update_in(cx, |editor, window, cx| {
+            editor.redo(&editor::actions::Redo, window, cx)
+        });
+        cx.run_until_parked();
+    };
+    let group = code.update_in(cx, |editor, window, cx| {
+        editor.buffer().update(cx, |buffer, cx| {
+            buffer.set_group_interval(std::time::Duration::from_secs(10), cx)
+        });
+        editor.move_to_end(&Default::default(), window, cx);
+        editor.insert("8", window, cx);
+        editor.buffer().read(cx).last_transaction_id(cx).unwrap()
+    });
+    cx.run_until_parked();
+    let edited = original.replace(&source, &format!(r#"["{first_line}\r\n","sample = 178"]"#));
+    assert_source(&edited, true, cx);
+    code.update_in(cx, |editor, window, cx| editor.insert("9", window, cx));
+    cx.run_until_parked();
+    code.update_in(cx, |editor, window, cx| {
+        editor.buffer().update(cx, |buffer, cx| {
+            buffer.set_group_interval(std::time::Duration::ZERO, cx)
+        });
+        editor.insert("0", window, cx);
+    });
+    cx.run_until_parked();
+    code.update(cx, |editor, cx| editor.group_until_transaction(group, cx));
+    let grouped = edited.replace("sample = 178", "sample = 17890");
+    assert_source(&grouped, true, cx);
+    undo(&code, cx);
+    assert_source(&original, false, cx);
+    redo(&code, cx);
+    assert_source(&grouped, true, cx);
+
+    markdown.update_in(cx, |editor, window, cx| {
+        editor.set_text("other\nedit", window, cx)
+    });
+    cx.run_until_parked();
+    undo(&code, cx);
+    let other_edit = original.replace(mixed_markdown, r#"["other\r\n","edit"]"#);
+    assert_source(&other_edit, true, cx);
+    undo(&markdown, cx);
+    assert_source(&original, false, cx);
+
+    redo(&code, cx);
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    cx.run_until_parked();
+    undo(&code, cx);
+    assert_source(&original, true, cx);
+    markdown.update_in(cx, |editor, window, cx| {
+        editor.set_text("new branch", window, cx)
+    });
+    cx.run_until_parked();
+    undo(&markdown, cx);
+    redo(&code, cx);
+    assert_source(&grouped, false, cx);
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    cx.run_until_parked();
+    assert!(workspace.read_with(cx, |workspace, cx| workspace.active_item(cx).is_none()));
+}
+
+#[gpui::test]
+async fn switching_to_source_preserves_cell_undo_until_the_raw_file_changes(
+    cx: &mut TestAppContext,
+) {
+    let (_, workspace, cx) = notebook_workspace(json!({"field.ipynb": NOTEBOOK}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    let code = |cx: &mut VisualTestContext| {
+        workspace.read_with(cx, |workspace, cx| {
+            let preview = workspace.active_item_as::<NotebookPreview>(cx).unwrap();
+            preview
+                .read(cx)
+                .notebook
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .cell(1)
+                .unwrap()
+                .editor(cx)
+                .unwrap()
+                .clone()
+        })
+    };
+    code(cx).update_in(cx, |editor, window, cx| {
+        editor.set_text("cell edit", window, cx)
+    });
+    cx.run_until_parked();
+    cx.dispatch_action(EditSource);
+    cx.run_until_parked();
+    cx.dispatch_action(OpenNotebook);
+    cx.run_until_parked();
+    code(cx).update_in(cx, |editor, window, cx| {
+        editor.undo(&editor::actions::Undo, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        code(cx).read_with(cx, |editor, cx| editor.text(cx)),
+        "print('from source')"
+    );
+    assert!(!workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item(cx).unwrap().is_dirty(cx)
+    }));
+    code(cx).update_in(cx, |editor, window, cx| {
+        editor.redo(&editor::actions::Redo, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        code(cx).read_with(cx, |editor, cx| editor.text(cx)),
+        "cell edit"
+    );
+    cx.dispatch_action(EditSource);
+    cx.run_until_parked();
+    let source = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<Editor>(cx).unwrap()
+    });
+    source.update_in(cx, |editor, window, cx| {
+        let changed = editor.text(cx).replace("cell edit", "raw edit");
+        editor.set_text(changed, window, cx)
+    });
+    cx.run_until_parked();
+    cx.dispatch_action(OpenNotebook);
+    cx.run_until_parked();
+    code(cx).update_in(cx, |editor, window, cx| {
+        editor.undo(&editor::actions::Undo, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        code(cx).read_with(cx, |editor, cx| editor.text(cx)),
+        "raw edit"
+    );
+}
+
+#[gpui::test]
 async fn test_unpreviewable_files_open_in_the_editor(cx: &mut TestAppContext) {
     let malformed = "{not valid JSON";
     let unsupported = r#"{"nbformat":99,"nbformat_minor":0,"cells":[],"metadata":{}}"#;
@@ -512,4 +697,53 @@ async fn test_unpreviewable_files_open_in_the_editor(cx: &mut TestAppContext) {
     workspace.read_with(cx, |workspace, cx| {
         assert!(workspace.active_item_as::<NotebookPreview>(cx).is_some());
     });
+}
+
+#[gpui::test]
+async fn an_unrelated_cell_edit_does_not_unblock_save(cx: &mut TestAppContext) {
+    let (fs, workspace, cx) = notebook_workspace(json!({"field.ipynb": NOTEBOOK}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    let view = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<NotebookPreview>(cx).unwrap()
+    });
+    let (raw, code, markdown) = view.read_with(cx, |view, cx| {
+        let notebook = view.notebook.as_ref().unwrap().read(cx);
+        (
+            view.editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap(),
+            notebook.cell(1).unwrap().editor(cx).unwrap().clone(),
+            notebook.cell(0).unwrap().editor(cx).unwrap().clone(),
+        )
+    });
+    code.update_in(cx, |editor, window, cx| {
+        editor.set_text("first edit", window, cx)
+    });
+    cx.run_until_parked();
+    raw.update(cx, |buffer, _| {
+        let transaction = buffer.peek_undo_stack().unwrap().transaction_id();
+        assert!(buffer.forget_transaction(transaction).is_some());
+    });
+    code.update_in(cx, |editor, window, cx| {
+        editor.undo(&editor::actions::Undo, window, cx)
+    });
+    cx.run_until_parked();
+    markdown.update_in(cx, |editor, window, cx| {
+        editor.set_text("other edit", window, cx)
+    });
+    cx.run_until_parked();
+    let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+    let save = view.update_in(cx, |view, window, cx| {
+        workspace::Item::save(view, Default::default(), project, window, cx)
+    });
+    assert!(save.await.is_err());
+    assert_eq!(
+        fs.load_bytes(Path::new(path!("/notebooks/field.ipynb")))
+            .await
+            .unwrap(),
+        NOTEBOOK.as_bytes()
+    );
 }

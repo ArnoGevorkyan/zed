@@ -15,7 +15,7 @@ pub(super) struct CellFields<T> {
     pub source: Range<T>,
     pub multiline: bool,
     pub execution: Option<ExecutionFields<T>>,
-    last_source: String,
+    pub(super) last_source: String,
 }
 
 pub(super) struct ExecutionFields<T> {

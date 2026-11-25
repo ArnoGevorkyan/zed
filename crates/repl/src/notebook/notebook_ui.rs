@@ -58,7 +58,7 @@ pub struct NotebookEditor {
     selected_cell_index: usize,
     cell_order: Vec<CellId>,
     source_version: clock::Global,
-    sync_error: Option<String>,
+    sync_errors: HashMap<usize, String>,
     cell_map: HashMap<CellId, Cell>,
     kernel: Kernel,
     kernel_specification: Option<LocalKernelSpecification>,
@@ -70,6 +70,88 @@ pub struct NotebookEditor {
 }
 
 struct NotebookKernelSession(gpui::WeakEntity<NotebookEditor>);
+
+#[derive(Default)]
+struct CellSourceHistory {
+    undo: Vec<CellSourceTransaction>,
+    redo: Vec<CellSourceTransaction>,
+}
+
+struct CellSourceTransaction {
+    cell_edit: clock::Lamport,
+    project: language::Transaction,
+}
+
+impl CellSourceHistory {
+    fn sync(
+        &mut self,
+        cell: &Entity<language::Buffer>,
+        fields: &mut CellFields<language::Anchor>,
+        buffer: &mut language::Buffer,
+        cx: &mut Context<language::Buffer>,
+    ) -> Result<()> {
+        let cell = cell.read(cx);
+        let source = cell.text_with_line_endings();
+        let cell_undo = cell
+            .peek_undo_stack()
+            .and_then(|entry| cell.get_transaction(entry.transaction_id()));
+        let cell_redo = cell
+            .peek_redo_stack()
+            .and_then(|entry| cell.get_transaction(entry.transaction_id()));
+        let undone = |entry: &CellSourceTransaction| {
+            cell_redo.is_some_and(|group| group.edit_ids.contains(&entry.cell_edit))
+        };
+        let applied = |entry: &CellSourceTransaction| {
+            cell_undo.is_some_and(|group| group.edit_ids.contains(&entry.cell_edit))
+        };
+        if let Some(mut entry) = self.undo.pop_if(|entry| undone(entry)) {
+            while let Some(mut earlier) = self.undo.pop_if(|entry| undone(entry)) {
+                buffer.merge_transactions(entry.project.id, earlier.project.id);
+                earlier.project.merge_in(entry.project);
+                entry = earlier;
+            }
+            if !buffer.undo_transaction(entry.project.id, cx) {
+                self.undo.push(entry);
+                anyhow::bail!("Could not undo the notebook cell edit");
+            }
+            self.redo.push(entry);
+        } else if let Some(entry) = self.redo.pop_if(|entry| applied(entry)) {
+            if !buffer.redo_transaction(entry.project.clone(), cx) {
+                self.redo.push(entry);
+                anyhow::bail!("Could not redo the notebook cell edit");
+            }
+            buffer.finalize_last_transaction();
+            self.undo.push(entry);
+        } else {
+            if fields.last_source == source {
+                return Ok(());
+            }
+            let cell_edit = cell_undo
+                .and_then(|group| group.edit_ids.last().copied())
+                .context("Missing notebook cell edit transaction")?;
+            let previous = self.undo.last_mut().filter(|entry| applied(entry));
+            let edits = fields.edit_source(&source)?;
+            buffer.finalize_last_transaction();
+            buffer.edit(edits, None, cx);
+            let transaction = buffer
+                .finalize_last_transaction()
+                .context("Missing notebook source transaction")?
+                .clone();
+            if let Some(entry) = previous {
+                buffer.merge_transactions(transaction.id, entry.project.id);
+                entry.project.merge_in(transaction);
+            } else {
+                self.undo.push(CellSourceTransaction {
+                    cell_edit,
+                    project: transaction,
+                });
+            }
+            self.redo.clear();
+        }
+        fields.last_source = source;
+        Ok(())
+    }
+}
 
 struct CellRun {
     cell_id: CellId,
@@ -166,14 +248,31 @@ impl NotebookEditor {
 
             if let Some(editor) = cell_entity.editor(cx).cloned() {
                 let focused_cell = cell_id.clone();
+                let mut history = CellSourceHistory::default();
                 cx.subscribe(&editor, move |this, editor, event, cx| {
                     if matches!(event, editor::EditorEvent::Focused) {
                         this.select_cell_by_id(&focused_cell, cx);
                     } else if matches!(event, editor::EditorEvent::BufferEdited) {
-                        let source = editor.read(cx).text(cx);
-                        let result =
-                            this.patch_cell(index, cx, |fields| fields.edit_source(&source));
-                        this.sync_error = result.err().map(|error| error.to_string());
+                        let result = editor
+                            .read(cx)
+                            .buffer()
+                            .read(cx)
+                            .as_singleton()
+                            .context("Cell source buffer no longer exists")
+                            .and_then(|cell| {
+                                this.update_cell(index, cx, |fields, buffer, cx| {
+                                    history.sync(&cell, fields, buffer, cx)
+                                })
+                            });
+                        match result {
+                            Ok(()) => {
+                                this.sync_errors.remove(&index);
+                            }
+                            Err(error) => {
+                                this.sync_errors
+                                    .insert(index, format!("Cell {}: {error}", index + 1));
+                            }
+                        }
                         cx.notify();
                     }
                 })
@@ -196,7 +295,7 @@ impl NotebookEditor {
             selected_cell_index: 0,
             cell_order,
             source_version: notebook_item.read(cx).buffer.read(cx).version(),
-            sync_error: None,
+            sync_errors: HashMap::default(),
             cell_map,
             kernel: Kernel::Shutdown,
             kernel_specification: None,
@@ -235,7 +334,7 @@ impl NotebookEditor {
             "Notebook execution is disabled in Restricted Mode. Trust this workspace to run Python."
         );
         anyhow::ensure!(
-            self.source_is_current(cx) && self.sync_error.is_none(),
+            self.source_is_current(cx) && self.sync_errors.is_empty(),
             "The notebook source changed. Reopen the notebook before running it."
         );
         Ok(())
@@ -288,6 +387,22 @@ impl NotebookEditor {
             &mut CellFields<language::Anchor>,
         ) -> Result<Vec<(std::ops::Range<language::Anchor>, String)>>,
     ) -> Result<()> {
+        self.update_cell(cell_index, cx, |fields, buffer, cx| {
+            buffer.edit(patch(fields)?, None, cx);
+            Ok(())
+        })
+    }
+
+    fn update_cell(
+        &mut self,
+        cell_index: usize,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(
+            &mut CellFields<language::Anchor>,
+            &mut language::Buffer,
+            &mut Context<language::Buffer>,
+        ) -> Result<()>,
+    ) -> Result<()> {
         let buffer = self.notebook_item.read(cx).buffer.clone();
         anyhow::ensure!(
             self.source_is_current(cx),
@@ -297,17 +412,14 @@ impl NotebookEditor {
             buffer.read(cx).capability().editable(),
             "The notebook source is read-only."
         );
-        let edits = self.notebook_item.update(cx, |item, _| {
-            patch(
-                item.fields
-                    .get_mut(cell_index)
-                    .context("Cell no longer exists")?,
-            )
+        self.notebook_item.update(cx, |item, cx| {
+            let fields = item
+                .fields
+                .get_mut(cell_index)
+                .context("Cell no longer exists")?;
+            buffer.update(cx, |buffer, cx| update(fields, buffer, cx))
         })?;
-        if !edits.is_empty() {
-            buffer.update(cx, |buffer, cx| buffer.edit(edits, None, cx));
-            self.source_version = buffer.read(cx).version();
-        }
+        self.source_version = buffer.read(cx).version();
         Ok(())
     }
 
@@ -346,7 +458,7 @@ impl NotebookEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if let Some(error) = &self.sync_error {
+        if let Some(error) = self.sync_errors.values().next() {
             return Task::ready(Err(anyhow::anyhow!("{error}")));
         }
         let buffer = self.notebook_item.read(cx).buffer.clone();
@@ -1125,9 +1237,10 @@ impl Render for NotebookEditor {
             .on_action(
                 cx.listener(|this, action, window, cx| this.interrupt_kernel(action, window, cx)),
             )
-            .when_some(self.sync_error.clone(), |container, error| {
-                container.child(Label::new(error).color(Color::Error))
-            })
+            .when_some(
+                self.sync_errors.values().next().cloned(),
+                |container, error| container.child(Label::new(error).color(Color::Error)),
+            )
             .child(if self.cell_order.is_empty() {
                 div()
                     .flex_1()

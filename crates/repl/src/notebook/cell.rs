@@ -384,7 +384,14 @@ fn new_cell_buffer(
     cx: &mut App,
 ) -> (Entity<Buffer>, Task<()>) {
     let buffer = cx.new(|cx| {
-        let buffer = Buffer::local(source, cx);
+        let line_ending = match source.split_once('\n') {
+            Some((first_line, _)) if first_line.ends_with('\r') => language::LineEnding::Windows,
+            Some(_) => language::LineEnding::Unix,
+            None => language::LineEnding::default(),
+        };
+        let mut source = source.to_owned();
+        language::LineEnding::normalize(&mut source);
+        let buffer = Buffer::local_normalized(source.as_str().into(), line_ending, cx);
         buffer.set_language_registry(languages.clone());
         buffer
     });

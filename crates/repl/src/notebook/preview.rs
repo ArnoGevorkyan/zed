@@ -22,6 +22,17 @@ pub(super) mod preview_tests;
 struct SourceBuffers(HashSet<EntityId>);
 impl Global for SourceBuffers {}
 
+struct NotebookSourceView {
+    notebook: Entity<NotebookEditor>,
+    window: gpui::WindowId,
+}
+
+impl editor::Addon for NotebookSourceView {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl SourceBuffers {
     fn remember(editor: &Entity<Editor>, cx: &mut App) {
         let buffer = editor.read(cx).buffer().clone();
@@ -175,6 +186,22 @@ impl NotebookPreview {
             if !buffer.read(cx).capability().editable() || item.read(cx).buffer != buffer {
                 return None;
             }
+            let retained = editor.update(cx, |editor, cx| {
+                let retained = editor
+                    .addon::<NotebookSourceView>()
+                    .filter(|view| {
+                        view.window == window.window_handle().window_id()
+                            && view.notebook.read(cx).source_is_current(cx)
+                            && Some(view.notebook.read(cx).project_path(cx))
+                                == editor.active_project_path(cx).as_ref()
+                    })
+                    .map(|view| view.notebook.clone());
+                editor.unregister_addon::<NotebookSourceView>();
+                retained
+            });
+            if retained.is_some() {
+                return retained;
+            }
             Some(cx.new(|cx| NotebookEditor::new(project, item, window, cx)))
         });
         cx.subscribe_in(
@@ -259,6 +286,7 @@ impl NotebookPreview {
     fn show_source(&self, explicit: bool, window: &mut Window, cx: &mut Context<Self>) {
         let preview = cx.entity();
         let editor = self.editor.clone();
+        let notebook = self.notebook.clone().filter(|_| explicit);
         let workspace = self.workspace.clone();
         window.defer(cx, move |window, cx| {
             let Some(workspace) = workspace.upgrade() else {
@@ -274,6 +302,15 @@ impl NotebookPreview {
                     .items_of_type::<Editor>()
                     .find(|item| item.read(cx).buffer().read(cx).as_singleton() == source_buffer)
                     .unwrap_or(editor);
+                if let Some(notebook) = notebook {
+                    notebook.update(cx, |notebook, cx| notebook.stop_kernel(cx));
+                    editor.update(cx, |editor, _| {
+                        editor.register_addon(NotebookSourceView {
+                            notebook,
+                            window: window.window_handle().window_id(),
+                        })
+                    });
+                }
                 SourceBuffers::remember(&editor, cx);
                 if workspace.pane_for_item_id(editor.entity_id()).is_some() {
                     if explicit {

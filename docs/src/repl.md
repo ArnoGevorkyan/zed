@@ -26,6 +26,8 @@ In a trusted local project, use the play button beside a Python cell to run it. 
 
 Save after a run to keep its output and execution count. Reopening the file shows saved results without executing code. The cell editor does not run rich HTML, JavaScript, or widgets. To add, delete, or reorder cells, use **Edit Source** or another notebook editor. These structural commands from the earlier notebook experiment are not part of this editor.
 
+To view a notebook in two panes, choose **Edit Source**, split the JSON editor, then choose **Open Notebook Editor** in one pane. Switching to source stops the kernel. If the JSON file itself mixes LF and CRLF line endings, saving normalizes them as it does in Zed’s text editor.
+
 ## Installation
 
 Zed supports running code in multiple languages. To get started, you need to install a kernel for the language you want to use.
