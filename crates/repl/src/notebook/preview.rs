@@ -4,7 +4,8 @@ use editor::{Editor, EditorEvent};
 
 use gpui::{App, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global, Task, WeakEntity};
 
-use project::{Project, ProjectItem as _, ProjectPath};
+use project::{MTime, Project, ProjectItem as _, ProjectPath, project_settings::ProjectSettings};
+use settings::Settings as _;
 use ui::prelude::*;
 use workspace::item::{ItemBufferKind, ItemEvent, SaveOptions, SerializableItem, TabContentParams};
 use workspace::{Item, ItemHandle, ItemId, Pane, Workspace, WorkspaceId};
@@ -455,18 +456,30 @@ impl SerializableItem for NotebookPreview {
         closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        if closing && self.is_dirty(cx) {
-            return None;
-        }
         let workspace_id = workspace.database_id()?;
-        let path = self.editor.read(cx).active_project_path(cx)?;
+        let editor = self.editor.read(cx);
+        let (buffer, dirty_snapshot) = editor.buffer_for_session(closing, cx)?;
+        let path = editor.active_project_path(cx)?;
         let path = workspace.project().read(cx).absolute_path(&path, cx)?;
+        let mtime = buffer
+            .read(cx)
+            .saved_mtime()
+            .and_then(MTime::to_seconds_and_nanos_for_persistence);
         let db = persistence::NotebookPreviewDb::global(cx);
-        Some(cx.background_spawn(async move { db.save_path(item_id, workspace_id, path).await }))
+        Some(cx.background_spawn(async move {
+            db.save_notebook(
+                item_id,
+                workspace_id,
+                path,
+                dirty_snapshot.map(|snapshot| snapshot.text()),
+                mtime,
+            )
+            .await
+        }))
     }
 
-    fn should_serialize(&self, _: &Self::Event) -> bool {
-        false
+    fn should_serialize(&self, event: &Self::Event) -> bool {
+        matches!(event, ItemEvent::Edit | ItemEvent::UpdateTab)
     }
 
     fn deserialize(
@@ -479,8 +492,8 @@ impl SerializableItem for NotebookPreview {
     ) -> Task<Result<Entity<Self>>> {
         let db = persistence::NotebookPreviewDb::global(cx);
         window.spawn(cx, async move |cx| {
-            let path = db
-                .get_path(item_id, workspace_id)?
+            let (path, contents, mtime) = db
+                .get_notebook(item_id, workspace_id)?
                 .context("No saved notebook path")?;
             let (worktree, path) = project
                 .update(cx, |project, cx| {
@@ -494,7 +507,24 @@ impl SerializableItem for NotebookPreview {
             let buffer = project
                 .update(cx, |project, cx| project.open_buffer(path.clone(), cx))
                 .await?;
-            let version = buffer.read_with(cx, |buffer, _| buffer.version());
+            let (version, restored) = buffer.update(cx, |buffer, cx| {
+                let contents = contents.filter(|_| {
+                    !buffer.is_dirty()
+                        && ProjectSettings::get_global(cx)
+                            .session
+                            .restore_unsaved_buffers
+                });
+                let restored = contents.is_some();
+                if let Some(contents) = contents {
+                    editor::items::restore_serialized_buffer_contents(
+                        buffer,
+                        contents,
+                        mtime.map(|(seconds, nanos)| MTime::from_seconds_and_nanos(seconds, nanos)),
+                        cx,
+                    );
+                }
+                (buffer.version(), restored)
+            });
             let parse = cx.update(|_, cx| NotebookItem::try_open(&project, &path, cx))?;
             let cells = match parse {
                 Some(parse) => parse.await.ok(),
@@ -502,7 +532,8 @@ impl SerializableItem for NotebookPreview {
             };
             cx.update(|window, cx| {
                 let cells = cells.filter(|_| {
-                    !buffer.read(cx).is_dirty() && buffer.read(cx).version() == version
+                    (restored || !buffer.read(cx).is_dirty())
+                        && buffer.read(cx).version() == version
                 });
                 let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project), window, cx));
                 cx.new(|cx| Self::new(workspace, editor, cells, window, cx))
@@ -539,29 +570,37 @@ mod persistence {
 
     impl Domain for NotebookPreviewDb {
         const NAME: &str = stringify!(NotebookPreviewDb);
-        const MIGRATIONS: &[&str] = &[sql!(
-            CREATE TABLE notebook_previews (
-                workspace_id INTEGER,
-                item_id INTEGER,
-                path BLOB NOT NULL,
-                alongside_source INTEGER NOT NULL,
-                PRIMARY KEY(workspace_id, item_id),
-                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-            ) STRICT;
-        )];
+        const MIGRATIONS: &[&str] = &[
+            sql!(
+                CREATE TABLE notebook_previews (
+                    workspace_id INTEGER,
+                    item_id INTEGER,
+                    path BLOB NOT NULL,
+                    alongside_source INTEGER NOT NULL,
+                    PRIMARY KEY(workspace_id, item_id),
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+                ) STRICT;
+            ),
+            sql!(
+                ALTER TABLE notebook_previews ADD COLUMN contents TEXT;
+                ALTER TABLE notebook_previews ADD COLUMN mtime_seconds INTEGER;
+                ALTER TABLE notebook_previews ADD COLUMN mtime_nanos INTEGER;
+            ),
+        ];
     }
 
     db::static_connection!(NotebookPreviewDb, [WorkspaceDb]);
 
     impl NotebookPreviewDb {
         query! {
-            pub async fn save_path(item_id: ItemId, workspace_id: WorkspaceId, path: PathBuf) -> Result<()> {
-                INSERT OR REPLACE INTO notebook_previews(item_id, workspace_id, path, alongside_source) VALUES (?, ?, ?, FALSE)
+            pub async fn save_notebook(item_id: ItemId, workspace_id: WorkspaceId, path: PathBuf, contents: Option<String>, mtime: Option<(u64, u32)>) -> Result<()> {
+                INSERT OR REPLACE INTO notebook_previews(item_id, workspace_id, path, alongside_source, contents, mtime_seconds, mtime_nanos)
+                VALUES (?, ?, ?, FALSE, ?, ?, ?)
             }
         }
         query! {
-            pub fn get_path(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<PathBuf>> {
-                SELECT path FROM notebook_previews WHERE item_id = ? AND workspace_id = ?
+            pub fn get_notebook(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(PathBuf, Option<String>, Option<(u64, u32)>)>> {
+                SELECT path, contents, mtime_seconds, mtime_nanos FROM notebook_previews WHERE item_id = ? AND workspace_id = ?
             }
         }
     }

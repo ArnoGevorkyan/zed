@@ -1470,23 +1470,9 @@ impl SerializableItem for Editor {
         closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        let buffer_serialization = self.buffer_serialization?;
         let project = self.project.clone()?;
-
-        let serialize_dirty_buffers = match buffer_serialization {
-            // Always serialize dirty buffers, including for worktree-less windows.
-            // This enables hot-exit functionality for empty windows and single files.
-            BufferSerialization::All => true,
-            BufferSerialization::NonDirtyBuffers => false,
-        };
-
-        if closing && !serialize_dirty_buffers {
-            return None;
-        }
-
         let workspace_id = workspace.database_id()?;
-
-        let buffer = self.buffer().read(cx).as_singleton()?;
+        let (buffer, dirty_snapshot) = self.buffer_for_session(closing, cx)?;
 
         let abs_path = buffer.read(cx).file().and_then(|file| {
             let worktree_id = file.worktree_id(cx);
@@ -1501,16 +1487,13 @@ impl SerializableItem for Editor {
                 })
         });
 
-        let is_dirty = buffer.read(cx).is_dirty();
         let mtime = buffer.read(cx).saved_mtime();
         let content_language_detection_enabled =
             buffer.read(cx).content_language_detection_enabled();
 
-        let snapshot = buffer.read(cx).snapshot();
-
         let db = EditorDb::global(cx);
         Some(cx.background_spawn(async move {
-            let (contents, language) = if serialize_dirty_buffers && is_dirty {
+            let (contents, language) = if let Some(snapshot) = dirty_snapshot {
                 let contents = snapshot.text();
                 let language = snapshot.language().and_then(|language| {
                     if content_language_detection_enabled && *language == *PLAIN_TEXT {
@@ -1636,6 +1619,21 @@ fn clip_ranges<'a>(
 impl EventEmitter<SearchEvent> for Editor {}
 
 impl Editor {
+    pub fn buffer_for_session(
+        &self,
+        closing: bool,
+        cx: &App,
+    ) -> Option<(Entity<Buffer>, Option<language::BufferSnapshot>)> {
+        let serialize_dirty = matches!(self.buffer_serialization?, BufferSerialization::All);
+        if closing && !serialize_dirty {
+            return None;
+        }
+        let buffer = self.buffer().read(cx).as_singleton()?;
+        let snapshot =
+            (serialize_dirty && buffer.read(cx).is_dirty()).then(|| buffer.read(cx).snapshot());
+        Some((buffer, snapshot))
+    }
+
     /// Panes keep increasing `detail` until tabs for files with the same name look different.
     pub fn tab_description(&self, detail: usize, cx: &App) -> Option<SharedString> {
         let path = path_for_buffer(&self.buffer, detail, false, cx)?;
@@ -2361,7 +2359,7 @@ fn path_for_file<'a>(
 /// This is somewhat wasteful since we load the whole buffer from disk then overwrite it,
 /// but keeps implementation simple as we don't need to persist all metadata from loading
 /// (git diff base, etc.).
-fn restore_serialized_buffer_contents(
+pub fn restore_serialized_buffer_contents(
     buffer: &mut Buffer,
     contents: String,
     mtime: Option<MTime>,

@@ -260,6 +260,101 @@ async fn test_edit_and_save_cells_in_restricted_mode(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_restore_unsaved_notebook_after_disk_edit(cx: &mut TestAppContext) {
+    use workspace::item::SerializableItem;
+
+    let (fs, original, cx) = notebook_workspace(json!({"field.ipynb": NOTEBOOK}), cx).await;
+    let db = cx.update(|_, cx| workspace::WorkspaceDb::global(cx));
+    let workspace_id = db.next_id().await.expect("workspace database ID");
+    let (project, app_state) =
+        original.read_with(cx, |ws, _| (ws.project().clone(), ws.app_state().clone()));
+    let (workspace, cx) = cx.add_window_view(|window, cx| {
+        Workspace::new(Some(workspace_id), project, app_state, window, cx)
+    });
+    open_file("field.ipynb", &workspace, cx).await;
+    let item_id = workspace.update_in(cx, |ws, window, cx| {
+        let view = ws
+            .active_item_as::<NotebookPreview>(cx)
+            .expect("notebook tab");
+        let cell_editor = view
+            .read(cx)
+            .notebook
+            .as_ref()
+            .expect("notebook")
+            .read(cx)
+            .cell(1)
+            .expect("code cell")
+            .editor(cx)
+            .expect("editor")
+            .clone();
+        cell_editor.update(cx, |editor, cx| editor.set_text("unsaved = 1", window, cx));
+        view.entity_id().as_u64()
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(workspace::SERIALIZATION_THROTTLE_TIME);
+    cx.run_until_parked();
+
+    let path = Path::new(path!("/notebooks/field.ipynb"));
+    assert_eq!(
+        fs.load_bytes(path).await.expect("original file"),
+        NOTEBOOK.as_bytes()
+    );
+    let disk_contents = NOTEBOOK.replace("print('from source')", "external = 2");
+    fs.insert_file(path, disk_contents.as_bytes().to_vec())
+        .await;
+    for recover in [true, false] {
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .session
+                        .get_or_insert_default()
+                        .restore_unsaved_buffers = Some(recover);
+                });
+            });
+        });
+        let project = Project::test(fs.clone(), [path!("/notebooks").as_ref()], cx).await;
+        let view = cx
+            .update(|window, cx| {
+                NotebookPreview::deserialize(
+                    project,
+                    workspace.downgrade(),
+                    workspace_id,
+                    item_id,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("restore notebook in a fresh project");
+        view.read_with(cx, |view, cx| {
+            let cell = view
+                .notebook
+                .as_ref()
+                .expect("notebook")
+                .read(cx)
+                .cell(1)
+                .expect("code");
+            assert_eq!(
+                cell.current_source(cx),
+                if recover {
+                    "unsaved = 1"
+                } else {
+                    "external = 2"
+                }
+            );
+            assert_eq!(view.editor.is_dirty(cx), recover);
+            assert_eq!(view.editor.has_conflict(cx), recover);
+        });
+        assert_eq!(
+            fs.load_bytes(path).await.expect("unchanged file"),
+            disk_contents.as_bytes()
+        );
+    }
+}
+
+#[gpui::test]
 async fn test_splitting_notebook_source_keeps_both_editors(cx: &mut TestAppContext) {
     let (_, workspace, cx) =
         notebook_workspace(json!({"field.ipynb": NOTEBOOK, "notes.txt": "notes"}), cx).await;
