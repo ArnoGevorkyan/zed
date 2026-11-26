@@ -607,7 +607,7 @@ mod test {
             }))?,
         )?;
         std::fs::write(root.path().join("sibling_module.py"), "RESULT = 42\n")?;
-        let output = util::command::new_std_command(&spec.path)
+        let output = smol::block_on(util::command::new_command(&spec.path)
             .current_dir(root.path())
             .env("JUPYTER_PATH", root.path())
             .env("IPYTHONDIR", root.path().join("ipython"))
@@ -625,7 +625,7 @@ with run_kernel(kernel_name="zed-test") as client:
     execute("sys.path.remove('')", 2)
     execute("assert '' not in sys.path and RESULT == 42", 3)
 "#])
-            .output()?;
+            .output())?;
         anyhow::ensure!(
             output.status.success(),
             "{}",
