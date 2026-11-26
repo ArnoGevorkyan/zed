@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use editor::{Editor, EditorMode, MultiBuffer, SizingBehavior};
+use editor::{
+    Editor, EditorMode, EditorSettings, EditorSettingsScrollbarProxy, MultiBuffer, SizingBehavior,
+};
 use futures::{StreamExt as _, future::Shared};
 use gpui::{
     App, Entity, EventEmitter, Focusable, Hsla, InteractiveElement, StatefulInteractiveElement,
@@ -12,7 +14,7 @@ use language::{Buffer, Language, LanguageRegistry};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use nbformat::v4::{CellId, CellMetadata, CellType};
 use settings::Settings as _;
-use ui::{CommonAnimationExt, IconButtonShape, prelude::*};
+use ui::{CommonAnimationExt, IconButtonShape, ScrollAxes, Scrollbars, WithScrollbar, prelude::*};
 use util::ResultExt;
 use zed_actions::notebook::InterruptKernel;
 
@@ -21,6 +23,13 @@ use crate::{
     outputs::{Output, plain, plain::TerminalOutput, user_error::ErrorView},
     repl_settings::ReplSettings,
 };
+
+fn preserve_middle_click(div: gpui::Div, cx: &App) -> gpui::Div {
+    div.when(
+        cx.platform_info().os == gpui::OperatingSystem::Windows,
+        |div| div.on_mouse_down(gpui::MouseButton::Middle, |_, _, cx| cx.stop_propagation()),
+    )
+}
 
 #[derive(Copy, Clone, PartialEq, PartialOrd)]
 pub enum CellPosition {
@@ -609,7 +618,7 @@ impl Render for MarkdownCell {
                         .bg(self.selected_bg_color(window, cx))
                         .child(self.gutter(window, cx))
                         .child(
-                            div()
+                            preserve_middle_click(div(), cx)
                                 .flex_1()
                                 .p_3()
                                 .bg(cx.theme().colors().editor_background)
@@ -674,6 +683,7 @@ pub struct CodeCell {
     pub(super) output_source: String,
     editor: Entity<editor::Editor>,
     outputs: Vec<Output>,
+    output_scroll: gpui::ScrollHandle,
     selected: bool,
     cell_position: Option<CellPosition>,
     _editor_subscription: gpui::Subscription,
@@ -749,6 +759,7 @@ impl CodeCell {
             output_source: source,
             editor,
             outputs,
+            output_scroll: Default::default(),
             selected: false,
             cell_position: None,
             execution_start_time: None,
@@ -1107,9 +1118,12 @@ impl RunnableCell for CodeCell {
     }
 }
 
-impl Render for CodeCell {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let stale = self.has_stale_outputs(cx);
+impl CodeCell {
+    fn render_output_viewport(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let output_max_height = ReplSettings::get_global(cx).output_max_height_lines;
         let output_max_height = if output_max_height > 0 {
             Some(window.line_height() * output_max_height as f32)
@@ -1118,6 +1132,65 @@ impl Render for CodeCell {
         };
         let output_max_width =
             plain::max_width_for_columns(ReplSettings::get_global(cx).max_columns, window, cx);
+        let content = v_flex()
+            .flex_none()
+            .min_w_full()
+            .children(self.outputs.iter().filter_map(|output| {
+                let content = output.content(window, cx)?;
+                Some(if matches!(output, Output::Markdown { .. }) {
+                    preserve_middle_click(div(), cx)
+                        .child(content)
+                        .into_any_element()
+                } else {
+                    content
+                })
+            }));
+        let horizontal = div()
+            .id("output-scroll")
+            .flex()
+            .items_start()
+            .w_full()
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .track_scroll(&self.output_scroll)
+            .child(content);
+        div()
+            .id("output-viewport")
+            .relative()
+            .w_full()
+            .when_some(output_max_width, |div, width| div.max_w(width))
+            .child(
+                div()
+                    .id("output-height")
+                    .when_some(output_max_height, |div, height| {
+                        div.max_h(height)
+                            .overflow_y_scroll()
+                            .restrict_scroll_to_axis()
+                    })
+                    .child(horizontal),
+            )
+            .when(
+                EditorSettings::get_global(cx).scrollbar.axes.horizontal,
+                |div| {
+                    div.custom_scrollbars(
+                        Scrollbars::for_settings::<EditorSettingsScrollbarProxy>()
+                            .tracked_scroll_handle(&self.output_scroll)
+                            .with_track_along(
+                                ScrollAxes::Horizontal,
+                                cx.theme().colors().editor_background,
+                            )
+                            .notify_content(),
+                        window,
+                        cx,
+                    )
+                },
+            )
+    }
+}
+
+impl Render for CodeCell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let stale = self.has_stale_outputs(cx);
         // get the language from the editor's buffer
         let language_name = self
             .editor
@@ -1156,7 +1229,12 @@ impl Render for CodeCell {
                                 .border_1()
                                 .border_color(cx.theme().colors().border)
                                 .bg(cx.theme().colors().editor_background)
-                                .child(div().flex_1().min_w_0().child(self.editor.clone()))
+                                .child(
+                                    preserve_middle_click(div(), cx)
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(self.editor.clone()),
+                                )
                                 // lang badge in top-right corner
                                 .when_some(language_name, |this, name| {
                                     this.child(
@@ -1274,29 +1352,7 @@ impl Render for CodeCell {
                                                     .color(Color::Warning),
                                             )
                                         })
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_start()
-                                                .id((
-                                                    ElementId::from(self.id.to_string()),
-                                                    "output-scroll",
-                                                ))
-                                                .w_full()
-                                                .overflow_x_scroll()
-                                                .restrict_scroll_to_axis()
-                                                .when_some(output_max_width, |div, max_width| {
-                                                    div.max_w(max_width)
-                                                })
-                                                .when_some(output_max_height, |div, max_height| {
-                                                    div.max_h(max_height).overflow_y_scroll()
-                                                })
-                                                .child(v_flex().flex_none().min_w_full().children(
-                                                    self.outputs.iter().filter_map(|output| {
-                                                        output.content(window, cx)
-                                                    }),
-                                                )),
-                                        ),
+                                        .child(self.render_output_viewport(window, cx)),
                                 ),
                             ),
                     )
