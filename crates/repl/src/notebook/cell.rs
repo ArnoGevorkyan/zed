@@ -798,14 +798,22 @@ impl CodeCell {
         !self.outputs.is_empty()
     }
 
+    pub(super) fn has_results(&self) -> bool {
+        self.has_outputs() || self.execution_count.is_some()
+    }
+
     pub(super) fn has_stale_outputs(&self, cx: &App) -> bool {
-        (self.has_outputs() || self.execution_count.is_some())
-            && self.current_source(cx) != self.output_source
+        self.has_results() && self.current_source(cx) != self.output_source
     }
 
     pub fn clear_outputs(&mut self) {
         self.outputs.clear();
         self.execution_duration = None;
+    }
+
+    pub(super) fn clear_results(&mut self) {
+        self.clear_outputs();
+        self.execution_count = None;
     }
 
     pub(super) fn queue_execution(&mut self) {
