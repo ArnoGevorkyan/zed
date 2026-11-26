@@ -398,6 +398,10 @@ impl Item for NotebookPreview {
 
     fn is_dirty(&self, cx: &App) -> bool {
         self.editor.is_dirty(cx)
+            || self
+                .notebook
+                .as_ref()
+                .is_some_and(|notebook| notebook.read(cx).has_unsynced_edits(cx))
     }
 
     fn has_conflict(&self, cx: &App) -> bool {

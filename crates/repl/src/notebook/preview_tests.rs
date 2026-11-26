@@ -3,7 +3,7 @@ use editor::Editor;
 use feature_flags::{
     FeatureFlag as _, FeatureFlagAppExt as _, FeatureFlagStore, NotebookFeatureFlag,
 };
-use gpui::{Entity, TestAppContext, UpdateGlobal as _, VisualTestContext};
+use gpui::{Entity, TestAppContext, UpdateGlobal as _, VisualContext as _, VisualTestContext};
 use project::trusted_worktrees::TrustedWorktrees;
 use project::{FakeFs, Fs as _, Project};
 use serde_json::{Value, json};
@@ -770,6 +770,8 @@ async fn an_unrelated_cell_edit_does_not_unblock_save(cx: &mut TestAppContext) {
         editor.set_text("first edit", window, cx)
     });
     cx.run_until_parked();
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    cx.run_until_parked();
     raw.update(cx, |buffer, _| {
         let transaction = buffer.peek_undo_stack().unwrap().transaction_id();
         assert!(buffer.forget_transaction(transaction).is_some());
@@ -778,6 +780,8 @@ async fn an_unrelated_cell_edit_does_not_unblock_save(cx: &mut TestAppContext) {
         editor.undo(&editor::actions::Undo, window, cx)
     });
     cx.run_until_parked();
+    assert!(!raw.read_with(cx, |buffer, _| buffer.is_dirty()));
+    assert!(view.read_with(cx, |view, cx| workspace::Item::is_dirty(view, cx)));
     markdown.update_in(cx, |editor, window, cx| {
         editor.set_text("other edit", window, cx)
     });
@@ -791,7 +795,9 @@ async fn an_unrelated_cell_edit_does_not_unblock_save(cx: &mut TestAppContext) {
         fs.load_bytes(Path::new(path!("/notebooks/field.ipynb")))
             .await
             .unwrap(),
-        NOTEBOOK.as_bytes()
+        NOTEBOOK
+            .replace("print('from source')", "first edit")
+            .as_bytes()
     );
 }
 
@@ -950,4 +956,57 @@ async fn batched_cell_history_saves_the_visible_source(cx: &mut TestAppContext) 
             .unwrap(),
         original.replace("sample = 1", "sample = 11356").as_bytes()
     );
+}
+
+#[gpui::test]
+async fn save_all_in_an_action_sequence_includes_a_new_cell_edit(cx: &mut TestAppContext) {
+    let original = NOTEBOOK.replace("print('from source')", "sample = 1");
+    let (fs, workspace, cx) = notebook_workspace(
+        json!({"field.ipynb": original, "control.txt": "sample = 1"}),
+        cx,
+    )
+    .await;
+    for name in ["control.txt", "field.ipynb"] {
+        open_file(name, &workspace, cx).await;
+        let editor = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item_as::<Editor>(cx).unwrap_or_else(|| {
+                let preview = workspace.active_item_as::<NotebookPreview>(cx).unwrap();
+                preview
+                    .read(cx)
+                    .notebook
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .cell(1)
+                    .unwrap()
+                    .editor(cx)
+                    .unwrap()
+                    .clone()
+            })
+        });
+        cx.focus(&editor);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.move_to_end(&Default::default(), window, cx)
+        });
+        cx.dispatch_action(settings::ActionSequence(vec![
+            Box::new(editor::actions::Newline),
+            Box::new(workspace::SaveAll { save_intent: None }),
+        ]));
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "sample = 1\n"
+        );
+        let expected = if name == "field.ipynb" {
+            original.replace("sample = 1", r#"sample = 1\n"#)
+        } else {
+            "sample = 1\n".to_owned()
+        };
+        assert_eq!(
+            fs.load_bytes(&Path::new(path!("/notebooks")).join(name))
+                .await
+                .unwrap(),
+            expected.as_bytes()
+        );
+    }
 }

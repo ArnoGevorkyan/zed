@@ -79,6 +79,10 @@ struct CellSourceHistory {
 }
 
 impl CellSourceHistory {
+    fn has_pending_edits(&self, cx: &App) -> bool {
+        self.cell.read(cx).as_text_snapshot().version() != &self.observed
+    }
+
     fn sync(
         &mut self,
         operation: &text::Operation,
@@ -462,8 +466,8 @@ impl NotebookEditor {
     pub(super) fn flush_cell_edits(&mut self, cx: &mut Context<Self>) -> Result<()> {
         let mut pending = Vec::new();
         for (&index, history) in &self.cell_sources {
-            let cell = history.cell.read(cx);
-            if cell.as_text_snapshot().version() != &history.observed {
+            if history.has_pending_edits(cx) {
+                let cell = history.cell.read(cx);
                 let mut version = history.observed.clone();
                 for (id, operation) in cell
                     .operations()
@@ -487,6 +491,14 @@ impl NotebookEditor {
             anyhow::bail!("{error}");
         }
         Ok(())
+    }
+
+    pub(super) fn has_unsynced_edits(&self, cx: &App) -> bool {
+        !self.sync_errors.is_empty()
+            || self
+                .cell_sources
+                .values()
+                .any(|history| history.has_pending_edits(cx))
     }
 
     fn persist_execution(
