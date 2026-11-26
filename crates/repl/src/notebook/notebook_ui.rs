@@ -889,24 +889,21 @@ impl NotebookEditor {
         } else if run.is_some() && specs.len() == 1 {
             specs.remove(0)
         } else {
-            let mut buttons: Vec<_> = specs
+            let choices = specs
                 .iter()
-                .map(|spec| {
-                    gpui::PromptButton::new(format!("{} ({})", spec.name, spec.path.display()))
-                })
+                .map(|spec| format!("{} ({})", spec.name, spec.path.display()).into())
                 .collect();
-            buttons.push(gpui::PromptButton::cancel("Cancel"));
             let choice = cx
                 .update(|window, cx| {
-                    window.prompt(
-                        gpui::PromptLevel::Info,
+                    ui_prompt::prompt_for_choices(
                         "Select a local Python kernel",
-                        Some(if run.is_some() {
+                        if run.is_some() {
                             "The requested execution will use this kernel."
                         } else {
                             "Selecting a kernel does not run a cell."
-                        }),
-                        &buttons,
+                        },
+                        choices,
+                        window,
                         cx,
                     )
                 })?
@@ -953,41 +950,44 @@ impl NotebookEditor {
                 self.worktree_id,
                 cx,
             );
-            sources.push(cx.background_spawn(specs));
+            sources.push(("Remote project", cx.background_spawn(specs)));
         }
         if global_kernels {
             if cfg!(windows) {
-                sources.push(
+                sources.push((
+                    "WSL",
                     cx.background_spawn(crate::kernels::wsl_kernel_specifications(
                         cx.background_executor().clone(),
                     )),
-                );
+                ));
             }
-            sources.extend(crate::repl_store::ReplStore::get_remote_kernel_specifications(cx));
+            if let Some(specs) = crate::repl_store::ReplStore::get_remote_kernel_specifications(cx)
+            {
+                sources.push(("Jupyter server", specs));
+            }
         }
         self.kernel_notice = Some("Finding remote notebook kernels…".into());
         self.kernel_task = Some(cx.spawn_in(window, async move |this, cx| {
             let pick = async {
                 let mut specs = Vec::new();
                 let mut details = vec!["Running a cell sends its source to the selected kernel. Selecting does not run code.".to_owned()];
-                for source in sources {
+                for (name, source) in sources {
                     match source.await {
                         Ok(found) => specs.extend(found),
-                        Err(error) => details.push(format!("Kernel discovery failed: {error}")),
+                        Err(_) => details.push(format!("{name} kernel discovery failed. Check the connection and credentials.")),
                     }
                 }
                 anyhow::ensure!(!specs.is_empty(), "{}", details.get(1).map(String::as_str).unwrap_or("No remote kernels found. Configure JUPYTER_SERVER and JUPYTER_TOKEN or open an SSH or WSL project."));
-                let mut buttons: Vec<_> = specs.iter().map(|spec| {
+                let choices = specs.iter().map(|spec| {
                     let location = match spec {
                         KernelSpecification::JupyterServer(server) => http_client::Url::parse(&server.url).map(|url| url.origin().ascii_serialization()).unwrap_or_else(|_| "Jupyter server".into()),
                         _ => spec.path().to_string(),
                     };
-                    gpui::PromptButton::new(format!("{} ({}: {})", spec.name(), spec.type_name(), location))
+                    format!("{} ({}: {})", spec.name(), spec.type_name(), location).into()
                 }).collect();
-                buttons.push(gpui::PromptButton::cancel("Cancel"));
                 let choice = this.update_in(cx, |editor, window, cx| {
                     editor.check_trust(cx)?;
-                    Ok::<_, anyhow::Error>(window.prompt(gpui::PromptLevel::Info, "Select a remote kernel", Some(&details.join("\n")), &buttons, cx))
+                    Ok::<_, anyhow::Error>(ui_prompt::prompt_for_choices("Select a remote kernel", &details.join("\n"), choices, window, cx))
                 })??.await?;
                 if let Some(spec) = specs.get(choice) {
                     this.update(cx, |editor, cx| {
