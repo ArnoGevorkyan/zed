@@ -2165,8 +2165,8 @@ impl Render for NotebookEditor {
                 self.cell_list(window, cx).into_any_element()
             })
             .child(self.render_kernel_status_bar(window, cx))
-            .when(self.mouse_autoscroll.is_some(), |div| {
-                div.child(
+            .when(self.mouse_autoscroll.is_some(), |notebook| {
+                notebook.child(
                     div()
                         .absolute()
                         .inset_0()
@@ -2791,7 +2791,9 @@ mod tests {
             NotebookPreview,
             preview::preview_tests::{notebook_workspace, open_file},
         };
-        use gpui::{Modifiers, OperatingSystem, PlatformInfo, PlatformTarget, point};
+        use gpui::{
+            Modifiers, OperatingSystem, PlatformInfo, PlatformTarget, UpdateGlobal as _, point,
+        };
         cx.set_platform_info(PlatformInfo {
             os: OperatingSystem::Windows,
             target: PlatformTarget::Native,
