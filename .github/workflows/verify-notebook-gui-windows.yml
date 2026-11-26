@@ -107,6 +107,8 @@ jobs:
         if: always()
         with:
           name: notebook-window-evidence
-          path: ${{ runner.temp }}/notebook-gui/proof
+          path: |
+            ${{ runner.temp }}/notebook-gui/proof
+            ${{ runner.temp }}/notebook-gui/profile/logs
           if-no-files-found: ignore
           retention-days: 7

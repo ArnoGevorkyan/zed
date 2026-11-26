@@ -16,6 +16,7 @@ public static class NotebookWindow {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
 }
 '@
 
@@ -51,9 +52,7 @@ function Record-Python($label) {
 
 function Start-Zed($label) {
     $arguments = @('--user-data-dir', "`"$userData`"", "`"$project`"", "`"$notebook`"")
-    $editor = Start-Process $zed -ArgumentList $arguments -PassThru `
-        -RedirectStandardOutput (Join-Path $proof "$label.stdout.log") `
-        -RedirectStandardError (Join-Path $proof "$label.stderr.log")
+    $editor = Start-Process $zed -ArgumentList $arguments -PassThru
     for ($i = 0; $i -lt 120; $i++) {
         $editor.Refresh()
         if ($editor.HasExited) { throw "Zed exited ($($editor.ExitCode)) before opening a window" }
@@ -61,24 +60,31 @@ function Start-Zed($label) {
         Start-Sleep -Seconds 1
     }
     if ($editor.MainWindowHandle -eq 0) { throw 'No Zed window appeared' }
-    Note "$label zed pid=$($editor.Id) window=$($editor.MainWindowHandle)"
+    Start-Sleep -Seconds 5
+    $editor.Refresh()
+    Note "$label zed pid=$($editor.Id) window=$($editor.MainWindowHandle) title=$($editor.MainWindowTitle)"
+    Focus $editor
     [NotebookWindow]::ShowWindow($editor.MainWindowHandle, 3) | Out-Null
     $editor
 }
 
 function Focus($editor) {
-    $window = $editor.MainWindowHandle
     for ($i = 0; $i -lt 10; $i++) {
-        [NotebookWindow]::SetForegroundWindow($window) | Out-Null
-        Start-Sleep -Milliseconds 500
+        $editor.Refresh()
+        $window = $editor.MainWindowHandle
         if ([NotebookWindow]::GetForegroundWindow() -eq $window) { return }
+        # Windows only lets a process take the foreground after recent input, so press and release Alt first.
+        [NotebookWindow]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [NotebookWindow]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [NotebookWindow]::SetForegroundWindow($window) | Out-Null
+        Start-Sleep -Seconds 1
     }
+    Note "foreground window $([NotebookWindow]::GetForegroundWindow()) is not Zed window $($editor.MainWindowHandle)"
+    Screen 'focus-failed'
     throw 'Cannot bring the Zed window to the foreground'
 }
 
-function Shot($editor, $name) {
-    Focus $editor
-    Start-Sleep -Milliseconds 500
+function Screen($name) {
     $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $image = New-Object Drawing.Bitmap($bounds.Width, $bounds.Height)
     $graphics = [Drawing.Graphics]::FromImage($image)
@@ -87,6 +93,12 @@ function Shot($editor, $name) {
     $graphics.Dispose()
     $image.Dispose()
     Note "screenshot $name"
+}
+
+function Shot($editor, $name) {
+    Focus $editor
+    Start-Sleep -Milliseconds 500
+    Screen $name
 }
 
 function Keys($editor, $keys, $seconds = 1) {
