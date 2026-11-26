@@ -1,0 +1,124 @@
+name: Verify notebook desktop on hosted macOS
+on:
+  push:
+    branches: [capy/verify-macos-notebook-a3cdac3d]
+permissions:
+  contents: read
+concurrency: mac-notebook-a3cdac3d
+jobs:
+  desktop:
+    if: github.repository == 'ArnoGevorkyan/zed'
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      PRODUCT_SHA: a3cdac3d5d5cc07b732499116bc3de0177755e1f
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: '0'
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: a3cdac3d5d5cc07b732499116bc3de0177755e1f
+          path: product
+          persist-credentials: false
+      - name: Identify pinned product and hosted Mac
+        id: host
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$(git -C product rev-parse HEAD)" = "$PRODUCT_SHA"
+          root="$RUNNER_TEMP/notebook"
+          mkdir -p "$root"/{project,proof,profile/config}
+          echo "NOTEBOOK_ROOT=$root" >> "$GITHUB_ENV"
+          echo "ZED_EXE=$GITHUB_WORKSPACE/product/target/debug/zed" >> "$GITHUB_ENV"
+          {
+            git -C product rev-parse HEAD; sw_vers; uname -m; df -h .
+            xcodebuild -version; cmake --version; stat -f 'console user: %Su' /dev/console
+            system_profiler SPDisplaysDataType
+          } | tee "$root/proof/host.txt"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Prepare unchanged fixture and local Python
+        id: python
+        run: |
+          venv="$NOTEBOOK_ROOT/project/.venv"
+          python -m venv "$venv"
+          "$venv/bin/python" -I -m pip install --only-binary=:all: ipykernel==7.4.0 matplotlib==3.11.2 nbformat pillow
+          "$venv/bin/python" -I harness/fixture.py create
+          "$venv/bin/python" -I -m ipykernel install --prefix "$NOTEBOOK_ROOT/kernel-control" --name mac-check
+          echo "ZED_NOTEBOOK_TEST_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
+          echo '{"enable_language_server":false,"show_completions_on_input":false,"auto_update":false,"telemetry":{"diagnostics":false,"metrics":false}}' > "$NOTEBOOK_ROOT/profile/config/settings.json"
+      - name: Run the two dependent cells outside Zed as a kernel control
+        run: |
+          JUPYTER_PATH="$NOTEBOOK_ROOT/kernel-control/share/jupyter" "$ZED_NOTEBOOK_TEST_PYTHON" -I harness/control.py | tee "$NOTEBOOK_ROOT/proof/kernel-control.txt"
+      - name: Probe desktop permissions without requesting access
+        id: probe
+        if: ${{ !cancelled() && steps.python.outcome == 'success' }}
+        run: |
+          "$ZED_NOTEBOOK_TEST_PYTHON" -I -m pip install --only-binary=:all: pyobjc-framework-Quartz pyobjc-framework-Metal
+          "$ZED_NOTEBOOK_TEST_PYTHON" -I harness/drive.py probe | tee "$NOTEBOOK_ROOT/proof/desktop-probe.txt"
+      - name: Restore the pinned build
+        id: cache
+        if: ${{ !cancelled() && steps.host.outcome == 'success' }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: mac15-arm-notebook-${{ env.PRODUCT_SHA }}-v1
+          path: product/target/debug/zed
+      - name: Compile Metal shader toolchain check
+        if: ${{ !cancelled() && steps.host.outcome == 'success' }}
+        run: |
+          if ! xcrun metal --version; then xcodebuild -downloadComponent MetalToolchain && xcrun metal --version; fi
+      - name: Build the exact macOS editor
+        id: build
+        if: ${{ !cancelled() && steps.host.outcome == 'success' }}
+        working-directory: product
+        run: |
+          if [[ "${{ steps.cache.outputs.cache-hit }}" != true ]]; then cargo build --locked -p zed --bin zed; fi
+          { file "$ZED_EXE"; shasum -a 256 "$ZED_EXE"; } | tee "$NOTEBOOK_ROOT/proof/binary.txt"
+      - name: Cache the built editor for harness corrections
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: mac15-arm-notebook-${{ env.PRODUCT_SHA }}-v1
+          path: product/target/debug/zed
+      - name: Open, edit, explicitly run, save, stop and reopen in the app
+        id: gui
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.probe.outcome == 'success' }}
+        working-directory: product
+        timeout-minutes: 7
+        run: |
+          export VIRTUAL_ENV="$NOTEBOOK_ROOT/project/.venv" PATH="$NOTEBOOK_ROOT/project/.venv/bin:$PATH"
+          python -I -u ../harness/drive.py gui 2>&1 | tee "$NOTEBOOK_ROOT/proof/desktop.txt"
+      - name: Record scoped window-launch diagnostics
+        if: ${{ failure() && steps.gui.outcome == 'failure' }}
+        run: |
+          grep -Eih 'compatible Metal|No GPU|failed to (create|open)|renderer|panicked' "$NOTEBOOK_ROOT"/first.log "$NOTEBOOK_ROOT"/profile/logs/Zed.log | tail -30 | tee "$NOTEBOOK_ROOT/proof/launch-diagnostics.txt" || true
+      - name: Native REPL suite when the desktop did not pass
+        id: tests
+        if: ${{ !cancelled() && steps.host.outcome == 'success' && steps.gui.outcome != 'success' }}
+        working-directory: product
+        run: |
+          cargo test --locked -p repl --lib | tee "$NOTEBOOK_ROOT/proof/native.txt"
+          grep -Eq 'test result: ok\. [1-9][0-9]+ passed' "$NOTEBOOK_ROOT/proof/native.txt"
+      - name: Native real-kernel sibling import and managed install controls
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' && steps.python.outcome == 'success' }}
+        working-directory: product
+        run: |
+          cargo test --locked -p repl --lib -- --ignored | tee "$NOTEBOOK_ROOT/proof/native-real.txt"
+          grep -q 'test result: ok\. 2 passed' "$NOTEBOOK_ROOT/proof/native-real.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: hosted-mac-evidence
+          path: ${{ runner.temp }}/notebook/proof
+          retention-days: 7
