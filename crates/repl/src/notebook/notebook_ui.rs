@@ -95,7 +95,7 @@ struct StructureStep {
     before: usize,
     after: usize,
     rewind: Option<BufferRewind>,
-    output_source: Option<String>,
+    removed: Option<(Cell, SourceTransactions, LineEndings)>,
 }
 
 #[derive(Clone, Copy)]
@@ -122,10 +122,17 @@ impl BufferRewind {
     }
 }
 
+type SourceTransactions =
+    HashMap<clock::Lamport, Option<(language::Transaction, std::ops::Range<language::Anchor>)>>;
+
+/// Newlines whose saved terminator differs from the cell buffer's line ending.
+type LineEndings = Vec<(language::Anchor, &'static str)>;
+
 struct CellSourceHistory {
     cell: Entity<language::Buffer>,
     observed: clock::Global,
-    transactions: HashMap<clock::Lamport, Option<language::Transaction>>,
+    transactions: SourceTransactions,
+    line_endings: LineEndings,
     _subscriptions: [gpui::Subscription; 3],
 }
 
@@ -148,13 +155,44 @@ impl CellSourceHistory {
         version.observe(operation.timestamp());
         let cell = self.cell.read(cx);
         let text = cell.rope_for_version(&version);
-        let source = text::chunks_with_line_ending(&text, cell.line_ending()).collect::<String>();
+        let source = if self.line_endings.is_empty() {
+            text::chunks_with_line_ending(&text, cell.line_ending()).collect::<String>()
+        } else {
+            let kept: HashMap<usize, &str> = cell
+                .offsets_at_version(
+                    self.line_endings.iter().map(|(newline, _)| newline),
+                    &version,
+                )
+                .zip(self.line_endings.iter().map(|(_, ending)| *ending))
+                .filter_map(|(offset, ending)| Some((offset?, ending)))
+                .collect();
+            let default_ending = cell.line_ending().as_str();
+            let normalized = text.to_string();
+            let mut source = String::with_capacity(normalized.len());
+            for (offset, character) in normalized.char_indices() {
+                if character == '\n' {
+                    source.push_str(kept.get(&offset).copied().unwrap_or(default_ending));
+                } else {
+                    source.push(character);
+                }
+            }
+            source
+        };
 
+        // A moved or deleted cell's earlier edits live in hidden notebook text
+        // until a structure undo makes that text visible at the cell again.
         if let text::Operation::Undo(undo) = operation
-            && undo
-                .counts
-                .keys()
-                .all(|id| self.transactions.contains_key(id))
+            && undo.counts.keys().all(|id| {
+                self.transactions.get(id).is_some_and(|edit| {
+                    edit.as_ref().is_none_or(|(_, source)| {
+                        source.start.is_valid(buffer)
+                            && source.end.is_valid(buffer)
+                            && source.start.to_offset(buffer)
+                                == fields.source.start.to_offset(buffer)
+                            && source.end.to_offset(buffer) == fields.source.end.to_offset(buffer)
+                    })
+                })
+            })
         {
             let mut affected: Vec<_> = undo
                 .counts
@@ -163,7 +201,7 @@ impl CellSourceHistory {
                     self.transactions
                         .get(edit)?
                         .as_ref()
-                        .map(|transaction| (transaction, *count))
+                        .map(|(transaction, _)| (transaction, *count))
                 })
                 .collect();
             affected.sort_unstable_by_key(|(transaction, _)| transaction.id);
@@ -204,12 +242,13 @@ impl CellSourceHistory {
         } else {
             buffer.finalize_last_transaction();
             buffer.edit(edits, None, cx);
-            Some(
+            Some((
                 buffer
                     .finalize_last_transaction()
                     .context("Missing notebook source transaction")?
                     .clone(),
-            )
+                fields.source.clone(),
+            ))
         };
         match operation {
             text::Operation::Edit(edit) => {
@@ -274,12 +313,9 @@ impl NotebookEditor {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         cx.on_focus(&focus_handle, window, |notebook, window, cx| {
-            if notebook.notebook_mode == NotebookMode::Edit
-                && let Some(editor) = notebook
-                    .get_selected_cell()
-                    .and_then(|cell| cell.editor(cx))
-            {
-                editor.focus_handle(cx).focus(window, cx);
+            // Blur hides a Markdown editor, so refocusing alone would send input to an unmounted editor.
+            if notebook.notebook_mode == NotebookMode::Edit {
+                notebook.enter_edit_mode(&EnterEditMode, window, cx);
             }
         })
         .detach();
@@ -323,23 +359,32 @@ impl NotebookEditor {
             remaining_runs: None,
             kernel_notice: None,
         };
+        let languages = editor.project.read(cx).languages().clone();
         for cell in cells {
-            editor.load_cell(&cell, window, cx);
-            editor.cell_order.push(cell.id().clone());
+            let cell_entity = Cell::load(
+                &cell,
+                &languages,
+                editor.notebook_language.clone(),
+                window,
+                cx,
+            );
+            let cell_id =
+                editor.attach_cell(cell_entity, &cell.source().concat(), None, window, cx);
+            editor.cell_order.push(cell_id);
         }
         editor.watch_kernel_trust(cx);
         editor
     }
 
-    fn load_cell(
+    fn attach_cell(
         &mut self,
-        cell: &nbformat::v4::Cell,
+        cell_entity: Cell,
+        source: &str,
+        history: Option<(SourceTransactions, LineEndings)>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let languages = self.project.read(cx).languages().clone();
-        let cell_id = cell.id();
-        let cell_entity = Cell::load(cell, &languages, self.notebook_language.clone(), window, cx);
+    ) -> CellId {
+        let cell_id = cell_entity.id(cx);
         let cell_events = match &cell_entity {
             Cell::Code(cell) => {
                 Some(
@@ -377,17 +422,21 @@ impl NotebookEditor {
                     this.apply_cell_operation(&edited_id, &buffer, operation, cx);
                 }
             });
+            let (transactions, line_endings) = history
+                .unwrap_or_else(|| (HashMap::default(), line_endings(buffer.read(cx), source)));
             self.cell_sources.insert(
                 cell_id.clone(),
                 CellSourceHistory {
                     observed: buffer.read(cx).version(),
                     cell: buffer,
-                    transactions: HashMap::default(),
+                    transactions,
+                    line_endings,
                     _subscriptions: [cell_events, focus_events, buffer_events],
                 },
             );
         }
         self.cell_map.insert(cell_id.clone(), cell_entity);
+        cell_id
     }
 
     fn check_execution(&self, cx: &mut App) -> Result<()> {
@@ -411,14 +460,28 @@ impl NotebookEditor {
             project.is_local(),
             "Notebook execution requires a local project."
         );
+        if matches!(
+            &self.kernel_specification,
+            Some(KernelSpecification::Jupyter(spec)) if !spec.is_notebook_python()
+        ) {
+            anyhow::ensure!(
+                Self::remote_enabled(cx),
+                "Choose a Python kernel. Other local kernels are disabled."
+            );
+            return Ok(());
+        }
         anyhow::ensure!(
-            self.notebook_item
-                .read(cx)
-                .language_name()
-                .is_none_or(|language| language.eq_ignore_ascii_case("python")),
+            self.is_python_notebook(cx),
             "Only Python notebooks can be executed."
         );
         Ok(())
+    }
+
+    fn is_python_notebook(&self, cx: &App) -> bool {
+        self.notebook_item
+            .read(cx)
+            .language_name()
+            .is_none_or(|language| language.eq_ignore_ascii_case("python"))
     }
 
     fn remote_enabled(cx: &App) -> bool {
@@ -440,7 +503,7 @@ impl NotebookEditor {
         });
         anyhow::ensure!(
             trusted,
-            "Notebook execution is disabled in Restricted Mode. Trust this workspace to run Python."
+            "Notebook execution is disabled in Restricted Mode. Trust this workspace to run cells."
         );
         anyhow::ensure!(
             self.source_is_current(cx) && self.sync_errors.is_empty(),
@@ -695,13 +758,7 @@ impl NotebookEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.check_execution(cx).and_then(|_| {
-            anyhow::ensure!(
-                run.is_some() || self.project.read(cx).is_local(),
-                "Choose a remote kernel for this project."
-            );
-            Ok(())
-        }) {
+        if let Err(error) = self.check_run(run.as_ref(), cx) {
             self.kernel_notice = Some(error.to_string());
             cx.notify();
             return;
@@ -714,7 +771,7 @@ impl NotebookEditor {
         let selected = run.as_ref().and(self.kernel_specification.clone());
         self.preparing_cell = run.as_ref().map(|run| run.cell_id.clone());
         let fs = self.project.read(cx).fs().clone();
-        self.kernel_notice = Some("Finding a Python kernel…".into());
+        self.kernel_notice = Some("Finding a kernel…".into());
         let prepare = cx.spawn_in(window, async move |this, cx| {
             let result = Self::prepare_kernel(&this, selected, fs, run.as_ref(), cx).await;
             this.update_in(cx, |editor, window, cx| {
@@ -749,15 +806,25 @@ impl NotebookEditor {
     }
 
     fn check_run(&self, run: Option<&CellRun>, cx: &mut App) -> Result<()> {
-        self.check_execution(cx)?;
-        if let Some(run) = run {
+        let Some(run) = run else {
+            self.check_trust(cx)?;
             anyhow::ensure!(
-                self.cell_map
-                    .get(&run.cell_id)
-                    .is_some_and(|cell| cell.current_source(cx) == run.source),
-                "The cell changed. Run it again."
+                self.project.read(cx).is_local(),
+                "Choose a remote kernel for this project."
             );
-        }
+            anyhow::ensure!(
+                Self::remote_enabled(cx) || self.is_python_notebook(cx),
+                "Only Python notebooks can be executed."
+            );
+            return Ok(());
+        };
+        self.check_execution(cx)?;
+        anyhow::ensure!(
+            self.cell_map
+                .get(&run.cell_id)
+                .is_some_and(|cell| cell.current_source(cx) == run.source),
+            "The cell changed. Run it again."
+        );
         Ok(())
     }
 
@@ -837,25 +904,30 @@ impl NotebookEditor {
         run: Option<&CellRun>,
         cx: &mut gpui::AsyncWindowContext,
     ) -> Result<Option<KernelSpecification>> {
-        let (mut specs, preferred) = if let Some(spec) = selected {
-            let KernelSpecification::Jupyter(spec) = spec else {
-                return Ok(Some(spec));
-            };
-            (vec![spec], None)
+        let (mut specs, preferred, list_kernelspecs) = if let Some(spec) = selected {
+            match spec {
+                KernelSpecification::Jupyter(spec) if spec.is_notebook_python() => {
+                    (vec![spec], None, false)
+                }
+                spec => return Ok(Some(spec)),
+            }
         } else {
-            let project_python = this
-                .update(cx, |editor, cx| {
-                    editor.check_run(run, cx)?;
-                    editor.project_python(run.is_some(), cx)
-                })??
-                .await;
+            let (project_python, list_kernelspecs) = this.update(cx, |editor, cx| {
+                editor.check_run(run, cx)?;
+                anyhow::Ok((
+                    editor.project_python(run.is_some(), cx)?,
+                    run.is_none() && Self::remote_enabled(cx),
+                ))
+            })??;
+            let project_python = project_python.await;
             let specs = cx
-                .background_spawn(crate::kernels::notebook_python_kernels(
+                .background_spawn(crate::kernels::notebook_kernel_choices(
                     fs,
                     project_python.clone(),
+                    list_kernelspecs,
                 ))
                 .await?;
-            (specs, project_python)
+            (specs, project_python, list_kernelspecs)
         };
         let mut diagnostic = None;
         if run.is_some() {
@@ -909,12 +981,18 @@ impl NotebookEditor {
         } else {
             let choices = specs
                 .iter()
-                .map(|spec| format!("{} ({})", spec.name, spec.path.display()).into())
+                .map(|spec| {
+                    format!("{} ({})", spec.kernelspec.display_name, spec.path.display()).into()
+                })
                 .collect();
             let choice = cx
                 .update(|window, cx| {
                     ui_prompt::prompt_for_choices(
-                        "Select a local Python kernel",
+                        if list_kernelspecs {
+                            "Select a local kernel"
+                        } else {
+                            "Select a local Python kernel"
+                        },
                         if run.is_some() {
                             "The requested execution will use this kernel."
                         } else {
@@ -1198,14 +1276,14 @@ impl NotebookEditor {
             CellChange::MoveDown if before + 1 < count => (CellEdit::Swap(before), before + 1),
             _ => return,
         };
-        let step = StructureStep {
+        let mut step = StructureStep {
             edit,
             before,
             after,
             rewind: None,
-            output_source: None,
+            removed: None,
         };
-        self.structure_error = match self.apply_structure(&step, window, cx) {
+        self.structure_error = match self.apply_structure(&mut step, window, cx) {
             Ok(inverse) => {
                 self.structure_undo.push(inverse);
                 self.structure_redo.clear();
@@ -1220,7 +1298,7 @@ impl NotebookEditor {
     }
 
     fn undo_structure(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(step) = (if redo {
+        let Some(mut step) = (if redo {
             &mut self.structure_redo
         } else {
             &mut self.structure_undo
@@ -1228,7 +1306,7 @@ impl NotebookEditor {
         .pop() else {
             return;
         };
-        let result = self.apply_structure(&step, window, cx);
+        let result = self.apply_structure(&mut step, window, cx);
         let (from, to) = if redo {
             (&mut self.structure_redo, &mut self.structure_undo)
         } else {
@@ -1249,7 +1327,7 @@ impl NotebookEditor {
 
     fn apply_structure(
         &mut self,
-        step: &StructureStep,
+        step: &mut StructureStep,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<StructureStep> {
@@ -1263,7 +1341,6 @@ impl NotebookEditor {
             buffer.read(cx).capability().editable(),
             "The notebook source is read-only."
         );
-        let mut output_source = None;
         if let CellEdit::Remove(index) = step.edit {
             let id = self
                 .cell_order
@@ -1285,11 +1362,6 @@ impl NotebookEditor {
                 self.preparing_cell.as_ref() != Some(id),
                 "Wait for this cell’s kernel setup to finish before deleting it."
             );
-            if let Some(Cell::Code(cell)) = self.cell_map.get(id)
-                && cell.read(cx).has_stale_outputs(cx)
-            {
-                output_source = Some(cell.read(cx).output_source.clone());
-            }
         }
         let snapshot = buffer.read(cx).as_text_snapshot().clone();
         let mut source = snapshot.text();
@@ -1317,11 +1389,19 @@ impl NotebookEditor {
                 .context("Missing notebook structure transaction")?;
             Ok::<_, anyhow::Error>(BufferRewind::Undo(transaction.id))
         })?;
+        let mut removed = None;
         match projection {
             Projection::Remove(index) => {
                 let id = self.cell_order.remove(index);
-                self.cell_map.remove(&id);
-                self.cell_sources.remove(&id);
+                let (transactions, line_endings) = self
+                    .cell_sources
+                    .remove(&id)
+                    .map(|history| (history.transactions, history.line_endings))
+                    .unwrap_or_default();
+                removed = self
+                    .cell_map
+                    .remove(&id)
+                    .map(|cell| (cell, transactions, line_endings));
                 self.display_slots.remove(&id);
                 self.notebook_item
                     .update(cx, |item, _| item.fields.remove(index));
@@ -1335,13 +1415,28 @@ impl NotebookEditor {
                 let fields = anchor_fields(fields, buffer.read(cx));
                 self.notebook_item
                     .update(cx, |item, _| item.fields.insert(index, fields));
-                self.load_cell(&cell, window, cx);
-                if let Some(source) = &step.output_source
-                    && let Some(Cell::Code(cell)) = self.cell_map.get(cell.id())
-                {
-                    cell.update(cx, |cell, _| cell.output_source.clone_from(source));
-                }
-                self.cell_order.insert(index, cell.id().clone());
+                let source = cell.source().concat();
+                let cell_id = match step.removed.take() {
+                    Some((cell, transactions, line_endings)) => self.attach_cell(
+                        cell,
+                        &source,
+                        Some((transactions, line_endings)),
+                        window,
+                        cx,
+                    ),
+                    None => {
+                        let languages = self.project.read(cx).languages().clone();
+                        let cell = Cell::load(
+                            &cell,
+                            &languages,
+                            self.notebook_language.clone(),
+                            window,
+                            cx,
+                        );
+                        self.attach_cell(cell, &source, None, window, cx)
+                    }
+                };
+                self.cell_order.insert(index, cell_id);
                 self.cell_list.splice(index..index, 1);
             }
             Projection::Swap { index, left, right } => {
@@ -1356,19 +1451,10 @@ impl NotebookEditor {
                             (right.start, left.start),
                             (left.start, right.end - left.len()),
                         ])
-                        .enumerate()
-                        .map(|(position, (fields, (from, to)))| {
+                        .map(|(fields, (from, to))| {
                             let relocate = |anchor: language::Anchor| {
                                 to + (anchor.to_offset(&snapshot) - from)
                             };
-                            if fields.source.start.to_offset(buffer)
-                                != relocate(fields.source.start)
-                                && let Some(history) = self
-                                    .cell_sources
-                                    .get_mut(&self.cell_order[index + position])
-                            {
-                                history.transactions.clear();
-                            }
                             fields.map_offsets(|range| {
                                 buffer.anchor_before(relocate(range.start))
                                     ..buffer.anchor_after(relocate(range.end))
@@ -1391,7 +1477,7 @@ impl NotebookEditor {
             before: step.after,
             after: step.before,
             rewind: Some(rewind),
-            output_source,
+            removed,
         })
     }
 
@@ -2318,6 +2404,29 @@ impl NotebookItem {
             notebook: parsed.notebook,
         }))
     }
+}
+
+fn line_endings(cell: &language::Buffer, source: &str) -> LineEndings {
+    let default_ending = cell.line_ending().as_str();
+    let mut line_endings = Vec::new();
+    let mut offset = 0;
+    let mut rest = source;
+    while let Some(index) = rest.find(['\r', '\n']) {
+        let ending = if rest[index..].starts_with("\r\n") {
+            "\r\n"
+        } else if rest[index..].starts_with('\r') {
+            "\r"
+        } else {
+            "\n"
+        };
+        offset += index;
+        if ending != default_ending {
+            line_endings.push((cell.anchor_after(offset), ending));
+        }
+        offset += 1;
+        rest = &rest[index + ending.len()..];
+    }
+    line_endings
 }
 
 fn anchor_fields(
@@ -3566,6 +3675,120 @@ mod tests {
                 "the next Run can rediscover a usable kernel"
             );
             assert_eq!(editor.notebook_item.read(cx).buffer.read(cx).text(), raw);
+        });
+    }
+
+    fn set_notebook_flag(enabled: bool, cx: &mut gpui::VisualTestContext) {
+        use feature_flags::{FeatureFlag as _, FeatureFlagStore};
+        use gpui::UpdateGlobal as _;
+        cx.update(|_, cx| {
+            FeatureFlagStore::init(cx);
+            if enabled {
+                cx.update_flags(false, vec![NotebookFeatureFlag::NAME.into()]);
+            } else {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings
+                            .feature_flags
+                            .get_or_insert_default()
+                            .insert(NotebookFeatureFlag::NAME.into(), "off".into());
+                    });
+                });
+            }
+            assert_eq!(NotebookEditor::remote_enabled(cx), enabled);
+        });
+    }
+
+    fn fake_r_kernelspec() -> (std::path::PathBuf, serde_json::Value) {
+        let directory = jupyter_zmq_client::dirs::data_dirs()
+            .into_iter()
+            .find(|directory| directory.is_absolute())
+            .unwrap()
+            .join("kernels/fake-r");
+        let kernelspec = json!({
+            "argv": [path!("/missing/fake-r"), "--vanilla", "{connection_file}"],
+            "display_name": "Fake R",
+            "language": "R",
+            "env": { "ZED_NOTEBOOK_MARKER": "synthetic-marker" },
+        });
+        (directory, kernelspec)
+    }
+
+    #[gpui::test]
+    async fn test_flagged_picker_launches_a_local_kernelspec_unchanged(cx: &mut TestAppContext) {
+        let raw = NOTEBOOK_WITH_ONE_CODE_CELL.replace("python", "R");
+        let (editor, cx) = kernel_test_editor(&raw, cx).await;
+        set_notebook_flag(true, cx);
+        let (_, kernelspec) = fake_r_kernelspec();
+        let directory =
+            std::path::PathBuf::from(path!("/notebooks/.venv/share/jupyter/kernels/fake-r"));
+        let fs = editor.read_with(cx, |editor, cx| editor.project.read(cx).fs().as_fake());
+        fs.insert_tree(&directory, json!({ "kernel.json": kernelspec.to_string() }))
+            .await;
+        trust_notebook(&editor, cx);
+        cx.executor().allow_parking();
+
+        let pick = editor.update_in(cx, |editor, window, cx| {
+            editor.choose_or_start_kernel(None, window, cx);
+            editor
+                .kernel_task
+                .clone()
+                .expect("the picker lists kernels")
+        });
+        cx.run_until_parked();
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+        cx.run_until_parked();
+        cx.dispatch_action(menu::SelectFirst);
+        cx.dispatch_action(menu::SelectPrevious);
+        cx.dispatch_action(menu::Confirm);
+        pick.await;
+        editor.read_with(cx, |editor, _| {
+            let Some(KernelSpecification::Jupyter(selected)) = &editor.kernel_specification else {
+                panic!("expected the kernelspec, got {:?}", editor.kernel_notice)
+            };
+            assert_eq!(selected.path, directory);
+            assert_eq!(selected.kernelspec.argv[1], "--vanilla");
+            assert_eq!(
+                selected.kernelspec.env.as_ref().unwrap()["ZED_NOTEBOOK_MARKER"],
+                "synthetic-marker"
+            );
+        });
+
+        let run = editor.update_in(cx, |editor, window, cx| {
+            editor.run_current_cell(&Run, window, cx);
+            editor
+                .kernel_task
+                .clone()
+                .expect("Run launches the selected kernel")
+        });
+        run.await;
+        editor.read_with(cx, |editor, cx| {
+            let notice = editor.kernel_notice.as_deref().unwrap();
+            assert!(notice.contains("Failed to start kernel fake-r"), "{notice}");
+            assert!(!notice.contains("synthetic-marker") && !notice.contains("--vanilla"));
+            assert_eq!(editor.notebook_item.read(cx).buffer.read(cx).text(), raw);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_unflagged_notebook_refuses_local_kernelspecs(cx: &mut TestAppContext) {
+        let (editor, cx) = kernel_test_editor(NOTEBOOK_WITH_ONE_CODE_CELL, cx).await;
+        set_notebook_flag(false, cx);
+        trust_notebook(&editor, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            let (path, kernelspec) = fake_r_kernelspec();
+            let stale = LocalKernelSpecification {
+                name: "fake-r".into(),
+                path,
+                kernelspec: serde_json::from_value(kernelspec).unwrap(),
+            };
+            editor.select_kernel(KernelSpecification::Jupyter(stale), cx);
+            editor.run_current_cell(&Run, window, cx);
+            assert_eq!(
+                editor.kernel_notice.as_deref(),
+                Some("Choose a Python kernel. Other local kernels are disabled.")
+            );
+            assert!(editor.kernel_task.is_none());
         });
     }
 
