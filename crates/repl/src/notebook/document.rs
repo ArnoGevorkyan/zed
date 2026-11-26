@@ -25,12 +25,12 @@ pub(super) struct ExecutionFields<T> {
 }
 
 #[derive(Deserialize)]
-struct RawNotebook<'a> {
+struct RawNotebook<'a, Cells> {
     nbformat: u32,
     nbformat_minor: u32,
-    metadata: &'a RawValue,
     #[serde(borrow)]
-    cells: Vec<RawCell<'a>>,
+    metadata: &'a RawValue,
+    cells: Cells,
 }
 
 #[derive(Deserialize)]
@@ -59,7 +59,7 @@ fn present_value<'de, D: Deserializer<'de>>(
     <&RawValue>::deserialize(deserializer).map(Some)
 }
 
-impl<'a> RawNotebook<'a> {
+impl<'a, Cells: Deserialize<'a>> RawNotebook<'a, Cells> {
     fn parse(text: &'a str) -> Result<Self> {
         let notebook: Self = serde_json::from_str(text)?;
         ensure!(
@@ -72,12 +72,18 @@ impl<'a> RawNotebook<'a> {
             notebook.metadata.get().starts_with('{'),
             "Invalid notebook metadata"
         );
+        Ok(notebook)
+    }
+}
+
+impl RawNotebook<'_, Vec<RawCell<'_>>> {
+    fn validate_cells(&self) -> Result<()> {
         let mut ids = HashSet::default();
-        for cell in &notebook.cells {
+        for cell in &self.cells {
             if let Some(id) = &cell.id {
                 ensure!(ids.insert(id), "Duplicate notebook cell ID: {id}");
             } else {
-                ensure!(notebook.nbformat_minor < 5, "Missing notebook cell ID");
+                ensure!(self.nbformat_minor < 5, "Missing notebook cell ID");
             }
             ensure!(
                 cell.metadata.get().starts_with('{'),
@@ -100,7 +106,7 @@ impl<'a> RawNotebook<'a> {
                 );
             }
         }
-        Ok(notebook)
+        Ok(())
     }
 }
 
@@ -118,14 +124,200 @@ impl<'a> RawCell<'a> {
     }
 }
 
+fn raw_range(text: &str, value: &RawValue) -> Result<Range<usize>> {
+    text.substr_range(value.get())
+        .map(Into::into)
+        .context("JSON value is outside the notebook")
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CellChange {
+    InsertCode,
+    InsertMarkdown,
+    Delete,
+    MoveUp,
+    MoveDown,
+}
+
+pub(super) enum CellEdit {
+    Add {
+        index: usize,
+        markdown: bool,
+    },
+    Remove(usize),
+    Restore {
+        index: usize,
+        raw: String,
+        offset: usize,
+    },
+    Swap(usize),
+}
+
+pub(super) enum Projection {
+    Remove(usize),
+    Insert {
+        index: usize,
+        cell: nbformat::v4::Cell,
+        fields: CellFields<usize>,
+    },
+    Swap {
+        index: usize,
+        left: Range<usize>,
+        right: Range<usize>,
+    },
+}
+
+pub(super) fn plan_cell_edit(
+    text: &str,
+    edit: &CellEdit,
+) -> Result<(Vec<(Range<usize>, String)>, CellEdit, Projection)> {
+    let notebook = RawNotebook::<&RawValue>::parse(text)?;
+    let cells: Vec<&RawValue> = serde_json::from_str(notebook.cells.get())?;
+    let array = raw_range(text, notebook.cells)?;
+    let start = array.start + 1;
+    let cell =
+        |index: usize| raw_range(text, cells.get(index).context("No cell at this position")?);
+    let insertion = |index: usize, offset: usize| -> Result<usize> {
+        ensure!(index <= cells.len(), "No insertion slot at this position");
+        if index < cells.len() {
+            Ok(cell(index)?.start)
+        } else if index > 0 {
+            Ok(cell(index - 1)?.end)
+        } else {
+            ensure!(
+                offset <= array.len() - 2,
+                "Invalid position in empty cell array"
+            );
+            Ok(start + offset)
+        }
+    };
+    let insert = |index, position, raw: String| -> Result<_> {
+        let object = raw.trim_matches([',', ' ', '\t', '\r', '\n']);
+        let start = position
+            + raw
+                .substr_range(object)
+                .context("Missing cell object")?
+                .start;
+        let prefix = r#"{"cells":["#;
+        let mut parsed = parse_view(&format!(
+            r#"{prefix}{object}],"metadata":{{}},"nbformat":4,"nbformat_minor":{}}}"#,
+            notebook.nbformat_minor
+        ))?;
+        let cell = parsed
+            .notebook
+            .cells
+            .pop()
+            .context("Missing inserted cell")?;
+        let fields = parsed
+            .fields
+            .pop()
+            .context("Missing inserted fields")?
+            .map_offsets(|range| {
+                start + (range.start - prefix.len())..start + (range.end - prefix.len())
+            });
+        Ok((
+            vec![(position..position, raw)],
+            CellEdit::Remove(index),
+            Projection::Insert {
+                index,
+                cell,
+                fields,
+            },
+        ))
+    };
+
+    Ok(match *edit {
+        CellEdit::Add { index, markdown } => {
+            let position = insertion(index, 0)?;
+            let mut new_cell = if markdown {
+                serde_json::json!({"cell_type":"markdown", "metadata":{}, "source":[]})
+            } else {
+                serde_json::json!({"cell_type":"code", "metadata":{}, "source":[], "outputs":[], "execution_count":null})
+            };
+            if notebook.nbformat_minor == 5 {
+                new_cell["id"] = uuid::Uuid::new_v4().to_string().into();
+            }
+            let raw = if cells.is_empty() {
+                new_cell.to_string()
+            } else {
+                let separator = if cells.len() == 1 {
+                    &format!(",{}", &text[start..cell(0)?.start])
+                } else {
+                    let left = index.saturating_sub(1).min(cells.len() - 2);
+                    &text[cell(left)?.end..cell(left + 1)?.start]
+                };
+                if index < cells.len() {
+                    format!("{new_cell}{separator}")
+                } else {
+                    format!("{separator}{new_cell}")
+                }
+            };
+            return insert(index, position, raw);
+        }
+        CellEdit::Remove(index) => {
+            let mut range = cell(index)?;
+            if index + 1 < cells.len() {
+                range.end = cell(index + 1)?.start;
+            } else if index > 0 {
+                range.start = cell(index - 1)?.end;
+            }
+            let restore = CellEdit::Restore {
+                index,
+                raw: text[range.clone()].to_owned(),
+                offset: range.start - start,
+            };
+            (
+                vec![(range, String::new())],
+                restore,
+                Projection::Remove(index),
+            )
+        }
+        CellEdit::Restore {
+            index,
+            ref raw,
+            offset,
+        } => {
+            let position = insertion(index, offset)?;
+            return insert(index, position, raw.clone());
+        }
+        CellEdit::Swap(index) => {
+            let first = cell(index)?;
+            let second = cell(index + 1)?;
+            let separator = &text[first.end..second.start];
+            let edits = if first.len() <= second.len() {
+                vec![
+                    (first.start..second.start, String::new()),
+                    (
+                        second.end..second.end,
+                        [separator, &text[first.clone()]].concat(),
+                    ),
+                ]
+            } else {
+                vec![
+                    (
+                        first.start..first.start,
+                        [&text[second.clone()], separator].concat(),
+                    ),
+                    (first.end..second.end, String::new()),
+                ]
+            };
+            (
+                edits,
+                CellEdit::Swap(index),
+                Projection::Swap {
+                    index,
+                    left: first,
+                    right: second,
+                },
+            )
+        }
+    })
+}
+
 pub(super) fn parse_view(text: &str) -> Result<ParsedNotebook> {
     let raw = RawNotebook::parse(text)?;
+    raw.validate_cells()?;
     let notebook = super::notebook_ui::upgrade_notebook(nbformat::parse_notebook(text)?)?;
-    let field_range = |value: &RawValue| -> Result<Range<usize>> {
-        text.substr_range(value.get())
-            .map(Into::into)
-            .context("Cell field is outside the notebook")
-    };
     let mut fields = Vec::with_capacity(raw.cells.len());
     for (raw, cell) in raw.cells.into_iter().zip(&notebook.cells) {
         let (source, execution) = match cell {
@@ -139,8 +331,8 @@ pub(super) fn parse_view(text: &str) -> Result<ParsedNotebook> {
                     output_count == outputs.len(),
                     "Unsupported notebook cell output"
                 );
-                let outputs = field_range(saved_outputs)?;
-                let count = field_range(count)?;
+                let outputs = raw_range(text, saved_outputs)?;
+                let count = raw_range(text, count)?;
                 (
                     source,
                     Some(ExecutionFields {
@@ -154,7 +346,7 @@ pub(super) fn parse_view(text: &str) -> Result<ParsedNotebook> {
             | nbformat::v4::Cell::Raw { source, .. } => (source, None),
         };
         fields.push(CellFields {
-            source: field_range(raw.source)?,
+            source: raw_range(text, raw.source)?,
             multiline: raw.source.get().starts_with('['),
             execution,
             last_source: source.concat(),
@@ -237,6 +429,165 @@ mod tests {
             result.replace_range(range, &replacement);
         }
         result
+    }
+
+    fn change_cell(text: &str, edit: &CellEdit) -> Result<(String, CellEdit)> {
+        let (edits, inverse, _) = plan_cell_edit(text, edit)?;
+        Ok((apply(text, edits), inverse))
+    }
+
+    #[test]
+    fn moving_and_deleting_cells_preserves_raw_objects_and_separators() -> Result<()> {
+        use CellEdit::{Remove, Swap};
+        let prefix = r#"{ "metadata":{"π":"[{}]", "cells":[]}, "nbformat_minor":4, "nbformat":4, "cells" : [  "#;
+        let suffix = "\r\n ] }\n";
+        let markdown =
+            r#"{"source":"猫", "attachments":{"a":{}}, "metadata":{}, "cell_type":"markdown"}"#;
+        let code = r#"{"cell_type":"code","execution_count":3,"outputs":[{"output_type":"stream","name":"stdout","text":["\u03c0\n"]}],"metadata":{"x":1.20e-7},"source":["print('π')\n"]}"#;
+        let raw = r#"{ "cell_type":"raw", "metadata":{}, "source":"]}," }"#;
+        let left = " \t,\r\n  ";
+        let right = ",\n\t";
+        let original = format!("{prefix}{markdown}{left}{code}{right}{raw}{suffix}");
+
+        for (edit, expected) in [
+            (Swap(0), format!("{code}{left}{markdown}{right}{raw}")),
+            (Swap(1), format!("{markdown}{left}{raw}{right}{code}")),
+            (Remove(0), format!("{code}{right}{raw}")),
+            (Remove(1), format!("{markdown}{left}{raw}")),
+            (Remove(2), format!("{markdown}{left}{code}")),
+        ] {
+            let (saved, inverse) = change_cell(&original, &edit)?;
+            assert_eq!(saved, format!("{prefix}{expected}{suffix}"));
+            assert_eq!(change_cell(&saved, &inverse)?.0, original);
+        }
+
+        let single = format!("{prefix}{markdown}{suffix}");
+        let (empty, restore) = change_cell(&single, &Remove(0))?;
+        assert_eq!(empty, format!("{prefix}{suffix}"));
+        assert_eq!(change_cell(&empty, &restore)?.0, single);
+        for (text, edit) in [
+            (&empty, Remove(0)),
+            (&single, Swap(0)),
+            (&original, Swap(2)),
+            (&original, Remove(3)),
+            (
+                &original,
+                CellEdit::Add {
+                    index: 4,
+                    markdown: false,
+                },
+            ),
+        ] {
+            assert!(plan_cell_edit(text, &edit).is_err());
+        }
+
+        let (removed, restore) = change_cell(&original, &Remove(1))?;
+        let edited = removed.replace("猫", "longer Markdown text");
+        let (edits, _, projection) = plan_cell_edit(&edited, &restore)?;
+        let restored = apply(&edited, edits);
+        assert_eq!(restored, original.replace("猫", "longer Markdown text"));
+        let Projection::Insert {
+            index: 1,
+            cell: nbformat::v4::Cell::Code { .. },
+            fields,
+        } = projection
+        else {
+            anyhow::bail!("expected restored code cell");
+        };
+        assert_eq!(&restored[fields.source], r#"["print('π')\n"]"#);
+        let execution = fields.execution.context("missing execution fields")?;
+        assert_eq!(&restored[execution.count], "3");
+        assert_eq!(
+            &restored[execution.outputs],
+            r#"[{"output_type":"stream","name":"stdout","text":["\u03c0\n"]}]"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn swapping_a_large_output_moves_only_the_small_cell_and_separator() -> Result<()> {
+        let small = r#"{"source":"猫","metadata":{},"cell_type":"markdown"}"#;
+        let large = format!(
+            r#"{{"cell_type":"code","metadata":{{}},"source":[],"execution_count":1,"outputs":[{{"output_type":"display_data","metadata":{{}},"data":{{"image/png":"{}"}}}}]}}"#,
+            "x".repeat(1 << 20)
+        );
+        let separator = " \t,\n ";
+        for (left, right) in [(small, large.as_str()), (large.as_str(), small)] {
+            let prefix = r#"{"nbformat":4,"nbformat_minor":4,"metadata":{},"cells":["#;
+            let original = format!("{prefix}{left}{separator}{right}]}}");
+            let (edits, _, projection) = plan_cell_edit(&original, &CellEdit::Swap(0))?;
+            let Projection::Swap {
+                index: 0,
+                left: first,
+                right: second,
+            } = projection
+            else {
+                anyhow::bail!("expected swapped cells");
+            };
+            assert_eq!(&original[first], left);
+            assert_eq!(&original[second], right);
+            let moved = small.len() + separator.len();
+            assert_eq!(
+                edits.iter().map(|(range, _)| range.len()).sum::<usize>(),
+                moved
+            );
+            assert_eq!(edits.iter().map(|(_, raw)| raw.len()).sum::<usize>(), moved);
+            assert_eq!(
+                apply(&original, edits),
+                format!("{prefix}{right}{separator}{left}]}}")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inserted_cells_have_the_right_shape_and_leave_existing_bytes_intact() -> Result<()> {
+        for index in 0..=3 {
+            for (markdown, expected) in [
+                (
+                    false,
+                    json!({"cell_type":"code", "source":[], "metadata":{}, "outputs":[], "execution_count":null}),
+                ),
+                (
+                    true,
+                    json!({"cell_type":"markdown", "source":[], "metadata":{}}),
+                ),
+            ] {
+                let (saved, undo) = change_cell(NOTEBOOK, &CellEdit::Add { index, markdown })?;
+                let cells: Value = serde_json::from_str(&saved)?;
+                assert_eq!(cells["cells"][index], expected);
+                assert_eq!(parse_view(&saved)?.notebook.cells.len(), 4);
+                assert_eq!(change_cell(&saved, &undo)?.0, NOTEBOOK);
+            }
+        }
+        let empty = r#"{ "cells" : [  ], "metadata":{}, "nbformat":4, "nbformat_minor":5 }"#;
+        let (one, undo_first) = change_cell(
+            empty,
+            &CellEdit::Add {
+                index: 0,
+                markdown: true,
+            },
+        )?;
+        let (two, undo_second) = change_cell(
+            &one,
+            &CellEdit::Add {
+                index: 1,
+                markdown: false,
+            },
+        )?;
+        assert_eq!(parse_view(&two)?.notebook.cells.len(), 2);
+        let value: Value = serde_json::from_str(&two)?;
+        let markdown = &value["cells"][0];
+        let code = &value["cells"][1];
+        assert_eq!(markdown["cell_type"], "markdown");
+        assert_eq!(code["cell_type"], "code");
+        assert!(markdown["id"].is_string() && code["id"].is_string());
+        assert_ne!(markdown["id"], code["id"]);
+        let (saved, redo_second) = change_cell(&two, &undo_second)?;
+        assert_eq!(saved, one);
+        assert_eq!(change_cell(&one, &redo_second)?.0, two);
+        assert_eq!(change_cell(&one, &undo_first)?.0, empty);
+        Ok(())
     }
 
     #[test]

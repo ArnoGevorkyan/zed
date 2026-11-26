@@ -671,7 +671,7 @@ pub struct CodeCell {
     id: CellId,
     metadata: CellMetadata,
     execution_count: Option<i32>,
-    source: String,
+    pub(super) output_source: String,
     editor: Entity<editor::Editor>,
     outputs: Vec<Output>,
     selected: bool,
@@ -746,7 +746,7 @@ impl CodeCell {
             id,
             metadata,
             execution_count,
-            source,
+            output_source: source,
             editor,
             outputs,
             selected: false,
@@ -800,7 +800,7 @@ impl CodeCell {
 
     pub(super) fn has_stale_outputs(&self, cx: &App) -> bool {
         (self.has_outputs() || self.execution_count.is_some())
-            && self.current_source(cx) != self.source
+            && self.current_source(cx) != self.output_source
     }
 
     pub fn clear_outputs(&mut self) {
@@ -816,7 +816,7 @@ impl CodeCell {
         self.execution_start_time = Some(Instant::now());
         self.is_executing = true;
         PreviousExecution {
-            source: std::mem::replace(&mut self.source, source),
+            source: std::mem::replace(&mut self.output_source, source),
             outputs: std::mem::take(&mut self.outputs),
             count: self.execution_count.take(),
             duration: self.execution_duration.take(),
@@ -825,7 +825,7 @@ impl CodeCell {
 
     pub(super) fn cancel_execution(&mut self, previous: Option<PreviousExecution>) {
         if let Some(previous) = previous {
-            self.source = previous.source;
+            self.output_source = previous.source;
             self.outputs = previous.outputs;
             self.execution_count = previous.count;
             self.execution_duration = previous.duration;
@@ -990,7 +990,7 @@ impl RenderableCell for CodeCell {
     }
 
     fn source(&self) -> &String {
-        &self.source
+        &self.output_source
     }
 
     fn control(&self, _window: &mut Window, cx: &mut Context<Self>) -> Option<CellControl> {

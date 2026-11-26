@@ -960,9 +960,9 @@ pub mod notebook {
             MoveCellUp,
             /// Moves the current cell down.
             MoveCellDown,
-            /// Adds a new markdown cell.
+            /// Inserts a Markdown cell below the selected cell.
             AddMarkdownBlock,
-            /// Adds a new code cell.
+            /// Inserts a code cell below the selected cell.
             AddCodeBlock,
             /// Deletes the current cell.
             DeleteCell,
