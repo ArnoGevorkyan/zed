@@ -8,6 +8,7 @@ public static class Win {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr w);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr w, int cmd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr w, out uint pid);
     [DllImport("user32.dll")] public static extern void keybd_event(byte key,byte scan,uint flags,UIntPtr extra);
 }
 '@
@@ -25,11 +26,15 @@ function Shot($name) {
     try { $g.CopyFromScreen($rect.Left,$rect.Top,0,0,$bmp.Size); $bmp.Save("$proof\$name.png",[Drawing.Imaging.ImageFormat]::Png) } finally { $g.Dispose(); $bmp.Dispose() }
 }
 function Keys($key,$seconds=1) {
+    $editor.Refresh()
+    $win = $editor.MainWindowHandle
     for ($i=0; $i -lt 8 -and [Win]::GetForegroundWindow() -ne $win; $i++) {
         [Win]::keybd_event(0x12,0,0,[UIntPtr]::Zero); [Win]::keybd_event(0x12,0,2,[UIntPtr]::Zero)
         [void][Win]::SetForegroundWindow($win); Start-Sleep -Milliseconds 350
     }
-    if ([Win]::GetForegroundWindow() -ne $win) { throw 'Editor is not foreground' }
+    $owner = [uint32]0
+    [void][Win]::GetWindowThreadProcessId([Win]::GetForegroundWindow(),[ref]$owner)
+    if ($owner -ne $editor.Id) { throw "Editor is not foreground (actual PID $owner, expected $($editor.Id))" }
     [Windows.Forms.SendKeys]::SendWait($key)
     Start-Sleep -Seconds $seconds
 }
@@ -72,6 +77,7 @@ function Wait-Saved($oldPid) {
     for ($i=0; $i -lt 40; $i++) {
         Keys '^s' 1
         $n = Get-Content -Raw $notebook | ConvertFrom-Json
+        if (!$n.cells[0].outputs -or !$n.cells[1].outputs) { continue }
         $firstText = $n.cells[0].outputs[0].text -join ''
         $secondText = $n.cells[1].outputs[0].text -join ''
         if ($firstText -match 'process=(\d+); basic=7' -and $secondText -eq "dependent=42`n") {
