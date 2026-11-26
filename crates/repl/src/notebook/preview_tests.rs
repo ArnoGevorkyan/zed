@@ -117,6 +117,10 @@ async fn author_cells_in_an_empty_restricted_notebook(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("n o t e");
     cx.dispatch_action(EnterCommandMode);
     assert_eq!(cell_sources(&workspace, cx), ["x", "note"]);
+    cx.dispatch_action(editor::actions::Undo);
+    assert_eq!(cell_sources(&workspace, cx), ["x"]);
+    cx.dispatch_action(editor::actions::Redo);
+    assert_eq!(cell_sources(&workspace, cx), ["x", "note"]);
 
     cx.dispatch_action(MoveCellUp);
     cx.dispatch_action(MoveCellUp);
@@ -230,7 +234,7 @@ async fn grouped_cell_edits_across_a_move_survive_command_undo_and_save(cx: &mut
 
     cx.dispatch_action(EnterCommandMode);
     cx.dispatch_action(editor::actions::Undo);
-    check(["neighbor", ""], cx);
+    check(["ab", "neighbor"], cx);
     cx.dispatch_action(settings::ActionSequence(vec![
         Box::new(editor::actions::Redo),
         Box::new(workspace::SaveAll { save_intent: None }),
