@@ -93,6 +93,46 @@ pub(in crate::notebook) async fn open_file(
     cx.run_until_parked();
 }
 
+#[gpui::test]
+async fn clearing_outputs_confirms_and_only_changes_saved_result_fields(cx: &mut TestAppContext) {
+    use zed_actions::notebook::ClearOutputs;
+    let file = NOTEBOOK.replace(
+        r#"{ "cell_type": "code", "id": "compute""#,
+        r#"{ "cell_type": "code", "id": "silent", "source": [], "metadata": {}, "outputs": [], "execution_count": 0 },
+    { "cell_type": "code", "id": "compute""#,
+    );
+    let (fs, workspace, cx) = notebook_workspace(json!({"clear.ipynb": file}), cx).await;
+    open_file("clear.ipynb", &workspace, cx).await;
+    let sources = cell_sources(&workspace, cx);
+    let path = Path::new(path!("/notebooks/clear.ipynb"));
+    cx.dispatch_action(ClearOutputs);
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    cx.run_until_parked();
+    assert_eq!(fs.load(path).await.unwrap(), file);
+
+    cx.dispatch_action(ClearOutputs);
+    cx.simulate_prompt_answer("Clear Outputs");
+    cx.run_until_parked();
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    cx.run_until_parked();
+    let cleared = file
+        .replace(r#""execution_count": 0"#, r#""execution_count": null"#)
+        .replace(r#""execution_count": 7"#, r#""execution_count": null"#)
+        .replace(
+            r#"[{"output_type":"stream", "name":"stdout", "text":["saved result\n"]}]"#,
+            "[]",
+        );
+    assert_eq!(fs.load(path).await.unwrap(), cleared);
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    cx.run_until_parked();
+    open_file("clear.ipynb", &workspace, cx).await;
+    assert_eq!(cell_sources(&workspace, cx), sources);
+    cx.dispatch_action(ClearOutputs);
+    assert!(cx.pending_prompt().is_none());
+}
+
 fn cell_sources(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
     workspace.read_with(cx, |workspace, cx| {
         let preview = workspace.active_item_as::<NotebookPreview>(cx).unwrap();

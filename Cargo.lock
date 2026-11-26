@@ -15387,6 +15387,7 @@ name = "repl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-compat",
  "async-dispatcher",
  "async-task",
  "async-trait",
@@ -15405,6 +15406,7 @@ dependencies = [
  "gpui",
  "html_to_markdown",
  "http_client",
+ "http_client_tls",
  "image",
  "indoc",
  "jupyter-protocol",
