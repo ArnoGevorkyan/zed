@@ -1842,6 +1842,8 @@ fn anchor_fields(
 }
 
 impl KernelSession for NotebookKernelSession {
+    const IS_NOTEBOOK: bool = true;
+
     fn check_launch(&self, cx: &mut Context<Self>) -> Result<()> {
         let id = cx.entity_id();
         self.0.update(cx, |editor, cx| {
