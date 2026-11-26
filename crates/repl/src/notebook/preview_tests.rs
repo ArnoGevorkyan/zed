@@ -14,7 +14,10 @@ use util::path;
 use util::rel_path::rel_path;
 use workspace::item::ItemHandle;
 use workspace::{AppState, MultiWorkspace, Workspace};
-use zed_actions::notebook::{EditSource, OpenNotebook};
+use zed_actions::notebook::{
+    AddCodeBlock, AddMarkdownBlock, DeleteCell, EditSource, EnterCommandMode, MoveCellDown,
+    MoveCellUp, OpenNotebook,
+};
 
 const NOTEBOOK: &str = r##"{
   "nbformat_minor": 5,  "nbformat": 4,
@@ -88,6 +91,240 @@ pub(in crate::notebook) async fn open_file(
         .await
         .expect("open project file");
     cx.run_until_parked();
+}
+
+fn cell_sources(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
+    workspace.read_with(cx, |workspace, cx| {
+        let preview = workspace.active_item_as::<NotebookPreview>(cx).unwrap();
+        let notebook = preview.read(cx).notebook.as_ref().unwrap().read(cx);
+        (0..)
+            .map_while(|index| notebook.cell(index))
+            .map(|cell| cell.current_source(cx))
+            .collect()
+    })
+}
+
+#[gpui::test]
+async fn author_cells_in_an_empty_restricted_notebook(cx: &mut TestAppContext) {
+    let original = r#"{"nbformat":4, "nbformat_minor":5, "metadata":{}, "cells":[ ]}"#;
+    let (fs, workspace, cx) = notebook_workspace(json!({"field.ipynb": original}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    cx.dispatch_action(AddCodeBlock);
+    assert_eq!(cell_sources(&workspace, cx), [""]);
+    cx.simulate_keystrokes("x");
+    cx.dispatch_action(EnterCommandMode);
+    cx.dispatch_action(AddMarkdownBlock);
+    cx.simulate_keystrokes("n o t e");
+    cx.dispatch_action(EnterCommandMode);
+    assert_eq!(cell_sources(&workspace, cx), ["x", "note"]);
+
+    cx.dispatch_action(MoveCellUp);
+    cx.dispatch_action(MoveCellUp);
+    assert_eq!(cell_sources(&workspace, cx), ["note", "x"]);
+    cx.dispatch_action(DeleteCell);
+    assert_eq!(cell_sources(&workspace, cx), ["x"]);
+    cx.dispatch_action(editor::actions::Undo);
+    assert_eq!(cell_sources(&workspace, cx), ["note", "x"]);
+    cx.dispatch_action(editor::actions::Redo);
+    cx.dispatch_action(DeleteCell);
+    assert!(cell_sources(&workspace, cx).is_empty());
+    cx.dispatch_action(editor::actions::Undo);
+    assert_eq!(cell_sources(&workspace, cx), ["x"]);
+    cx.dispatch_action(settings::ActionSequence(vec![
+        Box::new(editor::actions::Undo),
+        Box::new(workspace::SaveAll { save_intent: None }),
+    ]));
+
+    let saved = fs
+        .load(Path::new(path!("/notebooks/field.ipynb")))
+        .await
+        .unwrap();
+    let nbformat::Notebook::V4(saved) = nbformat::parse_notebook(&saved).unwrap() else {
+        panic!("expected a v4 notebook with valid cell IDs");
+    };
+    let [
+        nbformat::v4::Cell::Markdown {
+            id: markdown_id,
+            source: note,
+            ..
+        },
+        nbformat::v4::Cell::Code {
+            id: code_id,
+            source: code,
+            outputs,
+            execution_count,
+            ..
+        },
+    ] = saved.cells.as_slice()
+    else {
+        panic!("expected Markdown followed by code");
+    };
+    assert_ne!(markdown_id, code_id);
+    assert_eq!(note.concat(), "note");
+    assert_eq!(code.concat(), "x");
+    assert!(outputs.is_empty());
+    assert_eq!(*execution_count, None);
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    assert!(workspace.read_with(cx, |workspace, cx| workspace.active_item(cx).is_none()));
+    open_file("field.ipynb", &workspace, cx).await;
+    assert_eq!(cell_sources(&workspace, cx), ["note", "x"]);
+}
+
+#[gpui::test]
+async fn grouped_cell_edits_across_a_move_survive_command_undo_and_save(cx: &mut TestAppContext) {
+    use zed_actions::notebook::EnterEditMode;
+
+    let notebook = json!({
+        "nbformat": 4, "nbformat_minor": 5, "metadata": {},
+        "cells": [
+            {"cell_type":"code", "id":"code", "metadata":{}, "outputs":[], "execution_count":1, "source":[]},
+            {"cell_type":"markdown", "id":"note", "metadata":{}, "source":["neighbor"]}
+        ]
+    });
+    let (fs, workspace, cx) =
+        notebook_workspace(json!({"field.ipynb": notebook.to_string()}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    let parsed_sources = |text: &str| {
+        let nbformat::Notebook::V4(notebook) = nbformat::parse_notebook(text).unwrap() else {
+            panic!("expected a v4 notebook");
+        };
+        notebook
+            .cells
+            .iter()
+            .map(|cell| cell.source().concat())
+            .collect::<Vec<_>>()
+    };
+    let check = |expected: [&str; 2], cx: &mut VisualTestContext| {
+        assert_eq!(cell_sources(&workspace, cx), expected);
+        let raw = workspace.read_with(cx, |workspace, cx| {
+            let preview = workspace.active_item_as::<NotebookPreview>(cx).unwrap();
+            preview.read(cx).editor.read(cx).text(cx)
+        });
+        assert_eq!(parsed_sources(&raw), expected);
+    };
+
+    cx.dispatch_action(EnterEditMode);
+    cx.simulate_keystrokes("a");
+    let code = workspace.read_with(cx, |workspace, cx| {
+        let preview = workspace.active_item_as::<NotebookPreview>(cx).unwrap();
+        let notebook = preview.read(cx).notebook.as_ref().unwrap().read(cx);
+        notebook.cell(0).unwrap().editor(cx).unwrap().clone()
+    });
+    let first_edit = code.read_with(cx, |editor, cx| {
+        editor.buffer().read(cx).last_transaction_id(cx).unwrap()
+    });
+    cx.dispatch_action(EnterCommandMode);
+    cx.dispatch_action(MoveCellDown);
+    check(["neighbor", "a"], cx);
+    cx.dispatch_action(EnterEditMode);
+    cx.simulate_keystrokes("b");
+    code.update(cx, |editor, cx| {
+        editor.group_until_transaction(first_edit, cx)
+    });
+    drop(code);
+    check(["neighbor", "ab"], cx);
+    cx.dispatch_action(editor::actions::Undo);
+    check(["neighbor", ""], cx);
+    cx.dispatch_action(editor::actions::Redo);
+    check(["neighbor", "ab"], cx);
+
+    cx.dispatch_action(EnterCommandMode);
+    cx.dispatch_action(editor::actions::Undo);
+    check(["neighbor", ""], cx);
+    cx.dispatch_action(settings::ActionSequence(vec![
+        Box::new(editor::actions::Redo),
+        Box::new(workspace::SaveAll { save_intent: None }),
+    ]));
+    check(["neighbor", "ab"], cx);
+    let saved = fs
+        .load(Path::new(path!("/notebooks/field.ipynb")))
+        .await
+        .unwrap();
+    assert_eq!(parsed_sources(&saved), ["neighbor", "ab"]);
+    let stale = |cx: &mut VisualTestContext| {
+        workspace.read_with(cx, |workspace, cx| {
+            let preview = workspace.active_item_as::<NotebookPreview>(cx).unwrap();
+            let notebook = preview.read(cx).notebook.as_ref().unwrap().read(cx);
+            let Some(crate::notebook::Cell::Code(cell)) = notebook.cell(1) else {
+                panic!("missing moved code cell")
+            };
+            cell.read(cx).has_stale_outputs(cx)
+        })
+    };
+    assert!(stale(cx));
+    cx.dispatch_action(DeleteCell);
+    cx.dispatch_action(editor::actions::Undo);
+    check(["neighbor", "ab"], cx);
+    assert!(stale(cx));
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    assert!(workspace.read_with(cx, |workspace, cx| workspace.active_item(cx).is_none()));
+    open_file("field.ipynb", &workspace, cx).await;
+    check(["neighbor", "ab"], cx);
+}
+
+#[gpui::test]
+async fn structure_history_preserves_legacy_cells_through_edit_source(cx: &mut TestAppContext) {
+    let original = NOTEBOOK
+        .replace(r#""nbformat_minor": 5"#, r#""nbformat_minor": 4"#)
+        .replace(r#" "id": "intro","#, "")
+        .replace(r#" "id": "compute","#, "")
+        .replace("Field notes", r"Field \u00e9")
+        .replace(
+            r#""outputs": ["#,
+            r#""custom": {"untouched":42}, "outputs": [{"output_type":"display_data",
+                "data":{"image/png":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGP4DwABAQEAsTj2FAAAAABJRU5ErkJggg=="},"metadata":{}}, "#,
+        );
+    let path = Path::new(path!("/notebooks/field.ipynb"));
+    let (fs, workspace, cx) = notebook_workspace(json!({"field.ipynb": original}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    cx.dispatch_action(MoveCellDown);
+    cx.dispatch_action(menu::SelectFirst);
+    cx.dispatch_action(settings::ActionSequence(vec![
+        Box::new(DeleteCell),
+        Box::new(workspace::SaveAll { save_intent: None }),
+    ]));
+    let saved: Value = serde_json::from_str(&fs.load(path).await.unwrap()).unwrap();
+    let mut expected: Value = serde_json::from_str(&original).unwrap();
+    let code = expected["cells"].as_array_mut().unwrap().remove(1);
+    assert_eq!(saved, expected);
+
+    cx.dispatch_action(EditSource);
+    cx.dispatch_action(OpenNotebook);
+    cx.dispatch_action(editor::actions::Undo);
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    expected["cells"].as_array_mut().unwrap().insert(0, code);
+    let restored = fs.load(path).await.unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(), expected);
+    assert!(restored.contains(r"Field \u00e9"));
+
+    cx.dispatch_action(editor::actions::Undo);
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    assert_eq!(fs.load(path).await.unwrap(), original);
+    cx.dispatch_action(AddCodeBlock);
+    cx.dispatch_action(EnterCommandMode);
+    cx.dispatch_action(EditSource);
+    workspace.update_in(cx, |workspace, window, cx| {
+        let editor = workspace.active_item_as::<Editor>(cx).unwrap();
+        editor.update(cx, |editor, cx| {
+            let raw = editor.text(cx);
+            let saved: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(saved["nbformat_minor"], 4);
+            let cells = saved["cells"].as_array().unwrap();
+            assert_eq!(cells.len(), 3);
+            assert!(cells.iter().all(|cell| cell.get("id").is_none()));
+            editor.set_text(raw.replace("from source", "from JSON"), window, cx);
+        });
+    });
+    cx.dispatch_action(OpenNotebook);
+    cx.dispatch_action(editor::actions::Undo);
+    assert_eq!(
+        cell_sources(&workspace, cx),
+        [
+            "# Field é\n![sample](attachment:sample.png)",
+            "",
+            "print('from JSON')"
+        ]
+    );
 }
 
 #[gpui::test]
@@ -397,6 +634,7 @@ async fn test_restore_unsaved_notebook_after_disk_edit(cx: &mut TestAppContext) 
         snapshot,
         NOTEBOOK.replace("print('from source')", "unsaved = 1")
     );
+    cx.dispatch_action(MoveCellDown);
     cx.run_until_parked();
     cx.executor()
         .advance_clock(workspace::SERIALIZATION_THROTTLE_TIME);
@@ -441,7 +679,7 @@ async fn test_restore_unsaved_notebook_after_disk_edit(cx: &mut TestAppContext) 
                 .as_ref()
                 .expect("notebook")
                 .read(cx)
-                .cell(1)
+                .cell(if recover { 0 } else { 1 })
                 .expect("code");
             assert_eq!(
                 cell.current_source(cx),

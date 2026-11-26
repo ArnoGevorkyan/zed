@@ -25,12 +25,12 @@ pub(super) struct ExecutionFields<T> {
 }
 
 #[derive(Deserialize)]
-struct RawNotebook<'a> {
+struct RawNotebook<'a, Cells> {
     nbformat: u32,
     nbformat_minor: u32,
-    metadata: &'a RawValue,
     #[serde(borrow)]
-    cells: Vec<RawCell<'a>>,
+    metadata: &'a RawValue,
+    cells: Cells,
 }
 
 #[derive(Deserialize)]
@@ -59,7 +59,7 @@ fn present_value<'de, D: Deserializer<'de>>(
     <&RawValue>::deserialize(deserializer).map(Some)
 }
 
-impl<'a> RawNotebook<'a> {
+impl<'a, Cells: Deserialize<'a>> RawNotebook<'a, Cells> {
     fn parse(text: &'a str) -> Result<Self> {
         let notebook: Self = serde_json::from_str(text)?;
         ensure!(
@@ -72,12 +72,18 @@ impl<'a> RawNotebook<'a> {
             notebook.metadata.get().starts_with('{'),
             "Invalid notebook metadata"
         );
+        Ok(notebook)
+    }
+}
+
+impl RawNotebook<'_, Vec<RawCell<'_>>> {
+    fn validate_cells(&self) -> Result<()> {
         let mut ids = HashSet::default();
-        for cell in &notebook.cells {
+        for cell in &self.cells {
             if let Some(id) = &cell.id {
                 ensure!(ids.insert(id), "Duplicate notebook cell ID: {id}");
             } else {
-                ensure!(notebook.nbformat_minor < 5, "Missing notebook cell ID");
+                ensure!(self.nbformat_minor < 5, "Missing notebook cell ID");
             }
             ensure!(
                 cell.metadata.get().starts_with('{'),
@@ -100,7 +106,7 @@ impl<'a> RawNotebook<'a> {
                 );
             }
         }
-        Ok(notebook)
+        Ok(())
     }
 }
 
@@ -118,14 +124,93 @@ impl<'a> RawCell<'a> {
     }
 }
 
+fn raw_range(text: &str, value: &RawValue) -> Result<Range<usize>> {
+    text.substr_range(value.get())
+        .map(Into::into)
+        .context("JSON value is outside the notebook")
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CellChange {
+    InsertCode,
+    InsertMarkdown,
+    Delete,
+    MoveUp,
+    MoveDown,
+}
+
+pub(super) fn structure_edit(
+    text: &str,
+    selected: usize,
+    change: CellChange,
+) -> Result<Option<(Range<usize>, String)>> {
+    let notebook = RawNotebook::<&RawValue>::parse(text)?;
+    let cells: Vec<&RawValue> = serde_json::from_str(notebook.cells.get())?;
+    let cell = cells
+        .get(selected)
+        .map(|cell| raw_range(text, cell))
+        .transpose()?;
+    if cell.is_none() && !cells.is_empty() {
+        return Ok(None);
+    }
+    let previous = selected.checked_sub(1).and_then(|index| cells.get(index));
+    let next = cells.get(selected.saturating_add(1));
+    let edit = match change {
+        CellChange::InsertCode | CellChange::InsertMarkdown => {
+            let mut new_cell = if matches!(change, CellChange::InsertCode) {
+                serde_json::json!({"cell_type":"code", "metadata":{}, "source":[], "outputs":[], "execution_count":null})
+            } else {
+                serde_json::json!({"cell_type":"markdown", "metadata":{}, "source":[]})
+            };
+            if notebook.nbformat_minor == 5 {
+                new_cell["id"] = uuid::Uuid::new_v4().to_string().into();
+            }
+            let start = raw_range(text, notebook.cells)?.start + 1;
+            if let Some(cell) = cell {
+                let separator = if let Some(next) = next {
+                    &text[cell.end..raw_range(text, next)?.start]
+                } else if let Some(previous) = previous {
+                    &text[raw_range(text, previous)?.end..cell.start]
+                } else {
+                    &format!(",{}", &text[start..cell.start])
+                };
+                (cell.end..cell.end, format!("{separator}{new_cell}"))
+            } else {
+                (start..start, new_cell.to_string())
+            }
+        }
+        CellChange::Delete => {
+            let Some(mut range) = cell else {
+                return Ok(None);
+            };
+            if let Some(next) = next {
+                range.end = raw_range(text, next)?.start;
+            } else if let Some(previous) = previous {
+                range.start = raw_range(text, previous)?.end;
+            }
+            (range, String::new())
+        }
+        CellChange::MoveUp | CellChange::MoveDown => {
+            let Some(cell) = cell else {
+                return Ok(None);
+            };
+            let (first, second) = match (change, previous, next) {
+                (CellChange::MoveUp, Some(previous), _) => (raw_range(text, previous)?, cell),
+                (CellChange::MoveDown, _, Some(next)) => (cell, raw_range(text, next)?),
+                _ => return Ok(None),
+            };
+            let range = first.start..second.end;
+            let separator = &text[first.end..second.start];
+            (range, [&text[second], separator, &text[first]].concat())
+        }
+    };
+    Ok(Some(edit))
+}
+
 pub(super) fn parse_view(text: &str) -> Result<ParsedNotebook> {
     let raw = RawNotebook::parse(text)?;
+    raw.validate_cells()?;
     let notebook = super::notebook_ui::upgrade_notebook(nbformat::parse_notebook(text)?)?;
-    let field_range = |value: &RawValue| -> Result<Range<usize>> {
-        text.substr_range(value.get())
-            .map(Into::into)
-            .context("Cell field is outside the notebook")
-    };
     let mut fields = Vec::with_capacity(raw.cells.len());
     for (raw, cell) in raw.cells.into_iter().zip(&notebook.cells) {
         let (source, execution) = match cell {
@@ -139,8 +224,8 @@ pub(super) fn parse_view(text: &str) -> Result<ParsedNotebook> {
                     output_count == outputs.len(),
                     "Unsupported notebook cell output"
                 );
-                let outputs = field_range(saved_outputs)?;
-                let count = field_range(count)?;
+                let outputs = raw_range(text, saved_outputs)?;
+                let count = raw_range(text, count)?;
                 (
                     source,
                     Some(ExecutionFields {
@@ -154,7 +239,7 @@ pub(super) fn parse_view(text: &str) -> Result<ParsedNotebook> {
             | nbformat::v4::Cell::Raw { source, .. } => (source, None),
         };
         fields.push(CellFields {
-            source: field_range(raw.source)?,
+            source: raw_range(text, raw.source)?,
             multiline: raw.source.get().starts_with('['),
             execution,
             last_source: source.concat(),
@@ -237,6 +322,95 @@ mod tests {
             result.replace_range(range, &replacement);
         }
         result
+    }
+
+    fn change_cell(text: &str, index: usize, change: CellChange) -> Result<String> {
+        Ok(apply(
+            text,
+            vec![structure_edit(text, index, change)?.context("expected a cell edit")?],
+        ))
+    }
+
+    #[test]
+    fn moving_and_deleting_cells_preserves_raw_objects_and_separators() -> Result<()> {
+        use CellChange::*;
+        let prefix = r#"{ "metadata":{"π":"[{}]", "cells":[]}, "nbformat_minor":4, "nbformat":4, "cells" : [  "#;
+        let suffix = "\r\n ] }\n";
+        let markdown =
+            r#"{"source":"猫", "attachments":{"a":{}}, "metadata":{}, "cell_type":"markdown"}"#;
+        let code = r#"{"cell_type":"code","execution_count":3,"outputs":[{"output_type":"stream","name":"stdout","text":["\u03c0\n"]}],"metadata":{"x":1.20e-7},"source":["print('π')\n"]}"#;
+        let raw = r#"{ "cell_type":"raw", "metadata":{}, "source":"]}," }"#;
+        let left = " \t,\r\n  ";
+        let right = ",\n\t";
+        let original = format!("{prefix}{markdown}{left}{code}{right}{raw}{suffix}");
+
+        for (index, change, expected) in [
+            (0, MoveDown, format!("{code}{left}{markdown}{right}{raw}")),
+            (1, MoveUp, format!("{code}{left}{markdown}{right}{raw}")),
+            (1, MoveDown, format!("{markdown}{left}{raw}{right}{code}")),
+            (2, MoveUp, format!("{markdown}{left}{raw}{right}{code}")),
+            (0, Delete, format!("{code}{right}{raw}")),
+            (1, Delete, format!("{markdown}{left}{raw}")),
+            (2, Delete, format!("{markdown}{left}{code}")),
+        ] {
+            assert_eq!(
+                change_cell(&original, index, change)?,
+                format!("{prefix}{expected}{suffix}")
+            );
+        }
+        for (index, change) in [(0, MoveUp), (2, MoveDown), (3, Delete), (3, InsertCode)] {
+            assert!(structure_edit(&original, index, change)?.is_none());
+        }
+        let single = format!("{prefix}{markdown}{suffix}");
+        let empty = format!("{prefix}{suffix}");
+        assert_eq!(change_cell(&single, 0, Delete)?, empty);
+        for text in [&single, &empty] {
+            for change in [MoveUp, MoveDown] {
+                assert!(structure_edit(text, 0, change)?.is_none());
+            }
+        }
+        assert!(structure_edit(&empty, 0, Delete)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn inserted_cells_have_the_right_shape_and_leave_existing_bytes_intact() -> Result<()> {
+        for index in 0..3 {
+            for (change, expected) in [
+                (
+                    CellChange::InsertCode,
+                    json!({"cell_type":"code", "source":[], "metadata":{}, "outputs":[], "execution_count":null}),
+                ),
+                (
+                    CellChange::InsertMarkdown,
+                    json!({"cell_type":"markdown", "source":[], "metadata":{}}),
+                ),
+            ] {
+                let saved = change_cell(NOTEBOOK, index, change)?;
+                let cells: Value = serde_json::from_str(&saved)?;
+                assert_eq!(cells["cells"][index + 1], expected);
+                assert_eq!(parse_view(&saved)?.notebook.cells.len(), 4);
+                assert_eq!(
+                    change_cell(&saved, index + 1, CellChange::Delete)?,
+                    NOTEBOOK
+                );
+            }
+        }
+
+        let empty = r#"{ "cells" : [  ], "metadata":{}, "nbformat":4, "nbformat_minor":5 }"#;
+        let one = change_cell(empty, 0, CellChange::InsertMarkdown)?;
+        let two = change_cell(&one, 0, CellChange::InsertCode)?;
+        assert_eq!(parse_view(&two)?.notebook.cells.len(), 2);
+        let value: Value = serde_json::from_str(&two)?;
+        let markdown = &value["cells"][0];
+        let code = &value["cells"][1];
+        assert_eq!(markdown["cell_type"], "markdown");
+        assert_eq!(code["cell_type"], "code");
+        assert!(markdown["id"].is_string() && code["id"].is_string());
+        assert_ne!(markdown["id"], code["id"]);
+        assert_eq!(change_cell(&two, 1, CellChange::Delete)?, one);
+        assert_eq!(change_cell(&one, 0, CellChange::Delete)?, empty);
+        Ok(())
     }
 
     #[test]

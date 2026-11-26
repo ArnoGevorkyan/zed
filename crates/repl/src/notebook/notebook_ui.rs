@@ -2,7 +2,7 @@ use std::{future::Future, sync::Arc};
 
 use super::{
     Cell, CellEvent, CellPosition, CodeCell, MarkdownCellEvent, RenderableCell, RunnableCell,
-    document::{CellFields, ParsedNotebook},
+    document::{CellChange, CellFields, ParsedNotebook, parse_view, structure_edit},
 };
 use crate::kernels::{Kernel, KernelSession, LocalKernelSpecification, NativeRunningKernel};
 use crate::notebook::MovementDirection;
@@ -21,8 +21,8 @@ use ui::{Tooltip, prelude::*};
 use workspace::item::SaveOptions;
 use zed_actions::editor::{MoveDown, MoveUp};
 use zed_actions::notebook::{
-    EnterCommandMode, EnterEditMode, InterruptKernel, NotebookMoveDown, NotebookMoveUp,
-    RestartKernel, Run, RunAndAdvance,
+    AddCodeBlock, AddMarkdownBlock, DeleteCell, EnterCommandMode, EnterEditMode, InterruptKernel,
+    MoveCellDown, MoveCellUp, NotebookMoveDown, NotebookMoveUp, RestartKernel, Run, RunAndAdvance,
 };
 
 /// Whether the notebook is in command mode (navigating cells) or edit mode (editing a cell).
@@ -56,10 +56,14 @@ pub struct NotebookEditor {
     cell_list: ListState,
     notebook_mode: NotebookMode,
     selected_cell_index: usize,
+    structure_error: Option<String>,
+    opened_version: clock::Global,
+    structure_history: HashMap<text::TransactionId, StructureStep>,
     cell_order: Vec<CellId>,
     source_version: clock::Global,
     sync_errors: HashMap<usize, String>,
-    cell_sources: HashMap<usize, CellSourceHistory>,
+    cell_sources: HashMap<CellId, CellSourceHistory>,
+    notebook_language: Shared<Task<Option<Arc<Language>>>>,
     cell_map: HashMap<CellId, Cell>,
     kernel: Kernel,
     kernel_specification: Option<LocalKernelSpecification>,
@@ -72,10 +76,19 @@ pub struct NotebookEditor {
 
 struct NotebookKernelSession(gpui::WeakEntity<NotebookEditor>);
 
+#[derive(Clone)]
+struct StructureStep {
+    change: CellChange,
+    before: usize,
+    after: usize,
+    stale_output_source: Option<Arc<str>>,
+}
+
 struct CellSourceHistory {
     cell: Entity<language::Buffer>,
     observed: clock::Global,
-    transactions: HashMap<clock::Lamport, language::Transaction>,
+    transactions: HashMap<clock::Lamport, Option<language::Transaction>>,
+    _subscriptions: [gpui::Subscription; 3],
 }
 
 impl CellSourceHistory {
@@ -99,60 +112,73 @@ impl CellSourceHistory {
         let text = cell.rope_for_version(&version);
         let source = text::chunks_with_line_ending(&text, cell.line_ending()).collect::<String>();
 
+        if let text::Operation::Undo(undo) = operation
+            && undo
+                .counts
+                .keys()
+                .all(|id| self.transactions.contains_key(id))
+        {
+            let mut affected: Vec<_> = undo
+                .counts
+                .iter()
+                .filter_map(|(edit, count)| {
+                    self.transactions
+                        .get(edit)?
+                        .as_ref()
+                        .map(|transaction| (transaction, *count))
+                })
+                .collect();
+            affected.sort_unstable_by_key(|(transaction, _)| transaction.id);
+            for (transaction, _) in affected.iter().rev().filter(|(_, count)| count % 2 == 1) {
+                anyhow::ensure!(
+                    buffer.undo_transaction(transaction.id, cx),
+                    "Could not undo the notebook cell edit"
+                );
+            }
+            for (transaction, _) in affected.into_iter().filter(|(_, count)| count % 2 == 0) {
+                anyhow::ensure!(
+                    buffer.redo_transaction(transaction.clone(), cx),
+                    "Could not redo the notebook cell edit"
+                );
+                buffer.finalize_last_transaction();
+            }
+
+            let raw = buffer
+                .text_for_range(fields.source.clone())
+                .collect::<String>();
+            let mut restored: String = if fields.multiline {
+                serde_json::from_str::<Vec<String>>(&raw)?.concat()
+            } else {
+                serde_json::from_str(&raw)?
+            };
+            language::LineEnding::normalize(&mut restored);
+            anyhow::ensure!(
+                restored == text.to_string(),
+                "Cell source history no longer matches the notebook"
+            );
+            fields.last_source = source;
+            return Ok(());
+        }
+
+        let edits = fields.edit_source(&source)?;
+        let transaction = if edits.is_empty() {
+            None
+        } else {
+            buffer.finalize_last_transaction();
+            buffer.edit(edits, None, cx);
+            Some(
+                buffer
+                    .finalize_last_transaction()
+                    .context("Missing notebook source transaction")?
+                    .clone(),
+            )
+        };
         match operation {
             text::Operation::Edit(edit) => {
-                let edits = fields.edit_source(&source)?;
-                if !edits.is_empty() {
-                    buffer.finalize_last_transaction();
-                    buffer.edit(edits, None, cx);
-                    let transaction = buffer
-                        .finalize_last_transaction()
-                        .context("Missing notebook source transaction")?;
-                    self.transactions
-                        .insert(edit.timestamp, transaction.clone());
-                    return Ok(());
-                }
+                self.transactions.insert(edit.timestamp, transaction);
             }
-            text::Operation::Undo(undo) => {
-                let mut affected: Vec<_> = undo
-                    .counts
-                    .iter()
-                    .filter_map(|(edit, count)| {
-                        self.transactions
-                            .get(edit)
-                            .map(|transaction| (transaction, *count))
-                    })
-                    .collect();
-                affected.sort_unstable_by_key(|(transaction, _)| transaction.id);
-                for (transaction, _) in affected.iter().rev().filter(|(_, count)| count % 2 == 1) {
-                    anyhow::ensure!(
-                        buffer.undo_transaction(transaction.id, cx),
-                        "Could not undo the notebook cell edit"
-                    );
-                }
-                for (transaction, _) in affected.into_iter().filter(|(_, count)| count % 2 == 0) {
-                    anyhow::ensure!(
-                        buffer.redo_transaction(transaction.clone(), cx),
-                        "Could not redo the notebook cell edit"
-                    );
-                    buffer.finalize_last_transaction();
-                }
-            }
+            text::Operation::Undo(_) => self.transactions.clear(),
         }
-        let raw = buffer
-            .text_for_range(fields.source.clone())
-            .collect::<String>();
-        let mut restored: String = if fields.multiline {
-            serde_json::from_str::<Vec<String>>(&raw)?.concat()
-        } else {
-            serde_json::from_str(&raw)?
-        };
-        language::LineEnding::normalize(&mut restored);
-        anyhow::ensure!(
-            restored == text.to_string(),
-            "Cell source history no longer matches the notebook"
-        );
-        fields.last_source = source;
         Ok(())
     }
 }
@@ -210,7 +236,6 @@ impl NotebookEditor {
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        let languages = project.read(cx).languages().clone();
         let worktree_id = notebook_item.read(cx).project_path.worktree_id;
 
         let notebook_language = notebook_item.read(cx).notebook_language();
@@ -219,74 +244,7 @@ impl NotebookEditor {
             .shared();
 
         let cells = notebook_item.update(cx, |item, _| std::mem::take(&mut item.notebook.cells));
-        let mut cell_order = Vec::with_capacity(cells.len());
-        let mut cell_sources = HashMap::default();
-        let mut cell_map = HashMap::default();
-        for (index, cell) in cells.into_iter().enumerate() {
-            let cell_id = cell.id().clone();
-            cell_order.push(cell_id.clone());
-            let cell_entity = Cell::load(&cell, &languages, notebook_language.clone(), window, cx);
-
-            match &cell_entity {
-                Cell::Code(code_cell) => {
-                    let cell_id_for_focus = cell_id.clone();
-                    cx.subscribe_in(code_cell, window, move |this, _cell, event, window, cx| {
-                        match event {
-                            CellEvent::Run(cell_id) => {
-                                this.execute_cell(cell_id.clone(), false, window, cx);
-                            }
-                            CellEvent::FocusedIn(_) => {
-                                this.select_cell_by_id(&cell_id_for_focus, cx)
-                            }
-                        }
-                    })
-                    .detach();
-                }
-                Cell::Markdown(markdown_cell) => {
-                    cx.subscribe(markdown_cell, |_, cell, _: &MarkdownCellEvent, cx| {
-                        cell.update(cx, |cell, cx| cell.reparse_markdown(cx));
-                    })
-                    .detach();
-                }
-                Cell::Raw(_) => {}
-            }
-
-            if let Some(editor) = cell_entity.editor(cx).cloned() {
-                let focused_cell = cell_id.clone();
-                cx.subscribe(&editor, move |this, _, event, cx| {
-                    if matches!(event, editor::EditorEvent::Focused) {
-                        this.select_cell_by_id(&focused_cell, cx);
-                    }
-                })
-                .detach();
-                if let Some(cell) = editor.read(cx).buffer().read(cx).as_singleton() {
-                    cell_sources.insert(
-                        index,
-                        CellSourceHistory {
-                            cell: cell.clone(),
-                            observed: cell.read(cx).version(),
-                            transactions: HashMap::default(),
-                        },
-                    );
-                    cx.subscribe(&cell, move |this, _, event, cx| {
-                        let language::BufferEvent::Operation {
-                            operation: language::Operation::Buffer(operation),
-                            ..
-                        } = event
-                        else {
-                            return;
-                        };
-                        this.apply_cell_operation(index, operation, cx);
-                    })
-                    .detach();
-                }
-            }
-            cell_map.insert(cell_id, cell_entity);
-        }
-
-        let cell_count = cell_order.len();
-
-        let cell_list = ListState::new(cell_count, gpui::ListAlignment::Top, px(1000.));
+        let cell_list = ListState::new(cells.len(), gpui::ListAlignment::Top, px(1000.));
 
         let mut editor = Self {
             project,
@@ -296,11 +254,15 @@ impl NotebookEditor {
             cell_list,
             notebook_mode: NotebookMode::Command,
             selected_cell_index: 0,
-            cell_order,
+            structure_error: None,
+            opened_version: notebook_item.read(cx).buffer.read(cx).version(),
+            structure_history: HashMap::default(),
+            cell_order: Vec::with_capacity(cells.len()),
             source_version: notebook_item.read(cx).buffer.read(cx).version(),
             sync_errors: HashMap::default(),
-            cell_sources,
-            cell_map,
+            cell_sources: HashMap::default(),
+            cell_map: HashMap::default(),
+            notebook_language,
             kernel: Kernel::Shutdown,
             kernel_specification: None,
             execution_requests: HashMap::default(),
@@ -309,8 +271,71 @@ impl NotebookEditor {
             kernel_task: None,
             kernel_notice: None,
         };
+        for cell in cells {
+            editor.load_cell(&cell, window, cx);
+            editor.cell_order.push(cell.id().clone());
+        }
         editor.watch_kernel_trust(cx);
         editor
+    }
+
+    fn load_cell(
+        &mut self,
+        cell: &nbformat::v4::Cell,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let languages = self.project.read(cx).languages().clone();
+        let cell_id = cell.id();
+        let cell_entity = Cell::load(cell, &languages, self.notebook_language.clone(), window, cx);
+        let cell_events = match &cell_entity {
+            Cell::Code(cell) => {
+                Some(
+                    cx.subscribe_in(cell, window, |this, _, event, window, cx| match event {
+                        CellEvent::Run(id) => this.execute_cell(id.clone(), false, window, cx),
+                        CellEvent::FocusedIn(id) => this.select_cell_by_id(id, cx),
+                    }),
+                )
+            }
+            Cell::Markdown(cell) => {
+                Some(cx.subscribe(cell, |_, cell, _: &MarkdownCellEvent, cx| {
+                    cell.update(cx, |cell, cx| cell.reparse_markdown(cx));
+                }))
+            }
+            Cell::Raw(_) => None,
+        };
+
+        if let Some(cell_events) = cell_events
+            && let Some(editor) = cell_entity.editor(cx).cloned()
+            && let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton()
+        {
+            let focused_id = cell_id.clone();
+            let focus_events = cx.subscribe(&editor, move |this, _, event, cx| {
+                if matches!(event, editor::EditorEvent::Focused) {
+                    this.select_cell_by_id(&focused_id, cx);
+                }
+            });
+            let edited_id = cell_id.clone();
+            let buffer_events = cx.subscribe(&buffer, move |this, buffer, event, cx| {
+                if let language::BufferEvent::Operation {
+                    operation: language::Operation::Buffer(operation),
+                    ..
+                } = event
+                {
+                    this.apply_cell_operation(&edited_id, &buffer, operation, cx);
+                }
+            });
+            self.cell_sources.insert(
+                cell_id.clone(),
+                CellSourceHistory {
+                    observed: buffer.read(cx).version(),
+                    cell: buffer,
+                    transactions: HashMap::default(),
+                    _subscriptions: [cell_events, focus_events, buffer_events],
+                },
+            );
+        }
+        self.cell_map.insert(cell_id.clone(), cell_entity);
     }
 
     fn check_execution(&self, cx: &mut App) -> Result<()> {
@@ -419,8 +444,9 @@ impl NotebookEditor {
             "The notebook source is read-only."
         );
         let history = self
-            .cell_sources
-            .get_mut(&cell_index)
+            .cell_order
+            .get(cell_index)
+            .and_then(|id| self.cell_sources.get_mut(id))
             .context("Cell is not editable")?;
         let result = self.notebook_item.update(cx, |item, cx| {
             let fields = item
@@ -435,17 +461,20 @@ impl NotebookEditor {
 
     fn apply_cell_operation(
         &mut self,
-        index: usize,
+        cell_id: &CellId,
+        cell: &Entity<language::Buffer>,
         operation: &text::Operation,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .cell_sources
-            .get(&index)
-            .is_some_and(|history| history.observed.observed(operation.timestamp()))
-        {
+        let Some(history) = self.cell_sources.get(cell_id) else {
+            return;
+        };
+        if &history.cell != cell || history.observed.observed(operation.timestamp()) {
             return;
         }
+        let Some(index) = self.cell_order.iter().position(|id| id == cell_id) else {
+            return;
+        };
         let result = self.update_cell(index, cx, |fields, history, buffer, cx| {
             history.observed.observe(operation.timestamp());
             history.sync(operation, fields, buffer, cx)
@@ -464,8 +493,10 @@ impl NotebookEditor {
 
     pub(super) fn flush_cell_edits(&mut self, cx: &mut Context<Self>) -> Result<()> {
         let mut pending = Vec::new();
-        for (&index, history) in &self.cell_sources {
-            if history.has_pending_edits(cx) {
+        for (index, cell_id) in self.cell_order.iter().enumerate() {
+            if let Some(history) = self.cell_sources.get(cell_id)
+                && history.has_pending_edits(cx)
+            {
                 let cell = history.cell.read(cx);
                 let mut version = history.observed.clone();
                 for (id, operation) in cell
@@ -473,7 +504,7 @@ impl NotebookEditor {
                     .iter()
                     .filter(|(id, _)| !history.observed.observed(**id))
                 {
-                    pending.push((index, operation.clone()));
+                    pending.push((cell_id.clone(), history.cell.clone(), operation.clone()));
                     version.observe(*id);
                 }
                 anyhow::ensure!(
@@ -483,8 +514,8 @@ impl NotebookEditor {
                 );
             }
         }
-        for (index, operation) in pending {
-            self.apply_cell_operation(index, &operation, cx);
+        for (cell_id, cell, operation) in pending {
+            self.apply_cell_operation(&cell_id, &cell, &operation, cx);
         }
         if let Some(error) = self.sync_errors.values().next() {
             anyhow::bail!("{error}");
@@ -866,6 +897,270 @@ impl NotebookEditor {
         Ok(())
     }
 
+    fn change_structure(
+        &mut self,
+        change: CellChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.structure_error = self
+            .edit_structure(change, window, cx)
+            .err()
+            .map(|err| err.to_string());
+        cx.notify();
+    }
+
+    fn structure_buffer(&mut self, cx: &mut Context<Self>) -> Result<Entity<language::Buffer>> {
+        self.flush_cell_edits(cx)?;
+        anyhow::ensure!(
+            self.source_is_current(cx),
+            "The notebook source changed. Reopen the notebook before editing its cells."
+        );
+        let buffer = self.notebook_item.read(cx).buffer.clone();
+        anyhow::ensure!(
+            buffer.read(cx).capability().editable(),
+            "The notebook source is read-only."
+        );
+        Ok(buffer)
+    }
+
+    fn check_remove(&self, index: usize) -> Result<()> {
+        anyhow::ensure!(
+            self.kernel_task.is_none(),
+            "Wait for kernel setup before deleting a cell."
+        );
+        anyhow::ensure!(
+            !self
+                .execution_requests
+                .values()
+                .any(|run| Some(&run.cell_id) == self.cell_order.get(index)),
+            "This cell is queued or running. Wait for it to finish or stop the kernel before deleting it."
+        );
+        Ok(())
+    }
+
+    fn edit_structure(
+        &mut self,
+        change: CellChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let buffer = self.structure_buffer(cx)?;
+        let before = self.selected_cell_index;
+        let mut source = buffer.read(cx).text();
+        let Some((range, replacement)) = structure_edit(&source, before, change)? else {
+            return Ok(());
+        };
+        let count = self.cell_order.len();
+        let after = match change {
+            CellChange::InsertCode | CellChange::InsertMarkdown => (before + 1).min(count),
+            CellChange::Delete => {
+                self.check_remove(before)?;
+                before.min(count.saturating_sub(2))
+            }
+            CellChange::MoveUp => before - 1,
+            CellChange::MoveDown => before + 1,
+        };
+        source.replace_range(range.clone(), &replacement);
+        let parsed = parse_view(&source)?;
+        let step = StructureStep {
+            change,
+            before,
+            after,
+            stale_output_source: match (change, self.cell(before)) {
+                (CellChange::Delete, Some(Cell::Code(cell)))
+                    if cell.read(cx).has_stale_outputs(cx) =>
+                {
+                    Some(cell.read(cx).output_source.as_str().into())
+                }
+                _ => None,
+            },
+        };
+        let transaction = buffer
+            .update(cx, |buffer, cx| {
+                buffer.finalize_last_transaction();
+                buffer.edit([(range, replacement)], None, cx)?;
+                buffer.finalize_last_transaction().map(|tx| tx.id)
+            })
+            .context("Missing notebook structure transaction")?;
+        self.refresh_structure(parsed, Some(&step), true, window, cx);
+        self.structure_history.insert(transaction, step);
+        if matches!(change, CellChange::InsertCode | CellChange::InsertMarkdown) {
+            self.enter_edit_mode(&EnterEditMode, window, cx);
+        }
+        Ok(())
+    }
+
+    fn undo_structure(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.structure_error = self
+            .restore_history(redo, window, cx)
+            .err()
+            .map(|err| err.to_string());
+        cx.notify();
+    }
+
+    fn restore_history(
+        &mut self,
+        redo: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let buffer = self.structure_buffer(cx)?;
+        let source = buffer.read(cx);
+        let entry = if redo {
+            source.peek_redo_stack()
+        } else {
+            source.peek_undo_stack()
+        };
+        let Some(transaction) = entry.map(|entry| entry.transaction_id()) else {
+            return Ok(());
+        };
+        if self.opened_version.observed(transaction) {
+            return Ok(());
+        }
+        let step = self.structure_history.get(&transaction).cloned();
+        match &step {
+            Some(StructureStep {
+                change: CellChange::Delete,
+                before,
+                ..
+            }) if redo => self.check_remove(*before)?,
+            Some(StructureStep {
+                change: CellChange::InsertCode | CellChange::InsertMarkdown,
+                after,
+                ..
+            }) if !redo => self.check_remove(*after)?,
+            None => anyhow::ensure!(
+                self.kernel_task.is_none() && self.execution_requests.is_empty(),
+                "Wait for the running cells to finish or stop the kernel before undoing notebook edits."
+            ),
+            _ => {}
+        }
+        let parsed = buffer.update(cx, |buffer, cx| {
+            let applied = if redo {
+                buffer.redo(cx)
+            } else {
+                buffer.undo(cx)
+            };
+            anyhow::ensure!(applied == Some(transaction), "Notebook history changed");
+            let parsed = parse_view(&buffer.text());
+            if parsed.is_err() {
+                if redo {
+                    buffer.undo(cx)
+                } else {
+                    buffer.redo(cx)
+                };
+                self.source_version = buffer.version();
+            }
+            parsed
+        })?;
+        self.refresh_structure(parsed, step.as_ref(), redo, window, cx);
+        Ok(())
+    }
+
+    fn refresh_structure(
+        &mut self,
+        parsed: ParsedNotebook,
+        step: Option<&StructureStep>,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut order: Vec<_> = self.cell_order.drain(..).map(Some).collect();
+        if let Some(&StructureStep {
+            change,
+            before,
+            after,
+            ..
+        }) = step
+        {
+            self.selected_cell_index = if forward { after } else { before };
+            match (change, forward) {
+                (CellChange::InsertCode | CellChange::InsertMarkdown, true) => {
+                    order.insert(after, None)
+                }
+                (CellChange::Delete, false) => order.insert(before, None),
+                (CellChange::MoveUp | CellChange::MoveDown, _) => {
+                    order.swap(before, after);
+                    for index in [before, after] {
+                        if let Some(history) = order[index]
+                            .as_ref()
+                            .and_then(|id| self.cell_sources.get_mut(id))
+                        {
+                            history.transactions.clear();
+                        }
+                    }
+                }
+                _ => {
+                    let removed = if forward { before } else { after };
+                    if let Some(id) = order.remove(removed) {
+                        self.cell_map.remove(&id);
+                        self.cell_sources.remove(&id);
+                        self.display_slots.remove(&id);
+                    }
+                }
+            }
+        } else {
+            let buffer = self.notebook_item.read(cx).buffer.read(cx).snapshot();
+            for (index, (id, restored)) in order.iter_mut().zip(&parsed.fields).enumerate() {
+                let fields = &self.notebook_item.read(cx).fields[index];
+                let changed = |range: &std::ops::Range<language::Anchor>| {
+                    buffer.has_edits_since_in_range(&self.source_version, range.clone())
+                };
+                if fields
+                    .execution
+                    .as_ref()
+                    .is_some_and(|f| changed(&f.outputs) || changed(&f.count))
+                    && let Some(id) = id.take()
+                {
+                    self.cell_map.remove(&id);
+                    self.cell_sources.remove(&id);
+                    self.display_slots.remove(&id);
+                } else if restored.last_source != fields.last_source
+                    && let Some(id) = id.as_ref()
+                    && let Some(history) = self.cell_sources.get_mut(id)
+                {
+                    history.observed = history.cell.update(cx, |cell, cx| {
+                        cell.finalize_last_transaction();
+                        cell.set_text(restored.last_source.clone(), cx);
+                        cell.finalize_last_transaction();
+                        cell.version()
+                    });
+                    history.transactions.clear();
+                    if let Some(Cell::Markdown(cell)) = self.cell_map.get(id) {
+                        cell.update(cx, |cell, cx| cell.reparse_markdown(cx));
+                    }
+                }
+            }
+        }
+        self.notebook_item.update(cx, |item, cx| {
+            item.fields = anchor_fields(parsed.fields, item.buffer.read(cx));
+        });
+        for (existing, cell) in order.into_iter().zip(parsed.notebook.cells) {
+            let id = if let Some(id) = existing {
+                id
+            } else {
+                self.load_cell(&cell, window, cx);
+                cell.id().clone()
+            };
+            self.cell_order.push(id);
+        }
+        if !forward
+            && let Some(step) = step
+            && let Some(source) = &step.stale_output_source
+            && let Some(Cell::Code(cell)) = self.cell(step.before)
+        {
+            cell.update(cx, |cell, _| cell.output_source = source.to_string());
+        }
+        self.source_version = self.notebook_item.read(cx).buffer.read(cx).version();
+        self.cell_list.reset(self.cell_order.len());
+        if !self.cell_order.is_empty() {
+            self.cell_list
+                .scroll_to_reveal_item(self.selected_cell_index);
+        }
+        self.enter_command_mode(window, cx);
+    }
+
     fn get_selected_cell(&self) -> Option<&Cell> {
         self.cell_order
             .get(self.selected_cell_index)
@@ -1089,6 +1384,53 @@ impl NotebookEditor {
         self.cell_list.scroll_to_reveal_item(index);
     }
 
+    fn render_cell_controls(&self) -> impl IntoElement {
+        let on_click = |action: &'static dyn gpui::Action| {
+            let notebook = self.focus_handle.clone();
+            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                notebook.dispatch_action(action, window, cx)
+            }
+        };
+        h_flex()
+            .flex_wrap()
+            .px_3()
+            .py_1()
+            .gap_1()
+            .child(
+                Button::new("new-code-cell", "Add Code")
+                    .start_icon(Icon::new(IconName::Plus))
+                    .tooltip(Tooltip::for_action_title("Add Code Cell", &AddCodeBlock))
+                    .on_click(on_click(&AddCodeBlock)),
+            )
+            .child(
+                Button::new("new-markdown-cell", "Add Markdown")
+                    .start_icon(Icon::new(IconName::Plus))
+                    .tooltip(Tooltip::for_action_title(
+                        "Add Markdown Cell",
+                        &AddMarkdownBlock,
+                    ))
+                    .on_click(on_click(&AddMarkdownBlock)),
+            )
+            .child(
+                IconButton::new("move-cell-up", IconName::ArrowUp)
+                    .disabled(self.selected_cell_index == 0)
+                    .tooltip(Tooltip::for_action_title("Move Cell Up", &MoveCellUp))
+                    .on_click(on_click(&MoveCellUp)),
+            )
+            .child(
+                IconButton::new("move-cell-down", IconName::ArrowDown)
+                    .disabled(self.selected_cell_index >= self.cell_order.len().saturating_sub(1))
+                    .tooltip(Tooltip::for_action_title("Move Cell Down", &MoveCellDown))
+                    .on_click(on_click(&MoveCellDown)),
+            )
+            .child(
+                IconButton::new("delete-cell", IconName::Trash)
+                    .disabled(self.cell_order.is_empty())
+                    .tooltip(Tooltip::for_action_title("Delete Cell", &DeleteCell))
+                    .on_click(on_click(&DeleteCell)),
+            )
+    }
+
     fn render_kernel_status_bar(
         &self,
         _window: &mut Window,
@@ -1204,6 +1546,8 @@ impl NotebookEditor {
 
 impl Render for NotebookEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use editor::actions::{Redo, Undo};
+
         let mut key_context = KeyContext::new_with_defaults(cx.platform_info().os);
         key_context.add("NotebookEditor");
         key_context.set(
@@ -1224,12 +1568,40 @@ impl Render for NotebookEditor {
             .on_action(
                 cx.listener(|this, action, window, cx| this.run_and_advance(action, window, cx)),
             )
-            .on_action(
-                cx.listener(|this, action, window, cx| this.enter_edit_mode(action, window, cx)),
+            .when(
+                self.get_selected_cell()
+                    .and_then(|cell| cell.editor(cx))
+                    .is_some(),
+                |this| this.on_action(cx.listener(Self::enter_edit_mode)),
             )
             .on_action(cx.listener(|this, action, window, cx| {
                 this.handle_enter_command_mode(action, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &AddCodeBlock, window, cx| {
+                this.change_structure(CellChange::InsertCode, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AddMarkdownBlock, window, cx| {
+                this.change_structure(CellChange::InsertMarkdown, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveCellUp, window, cx| {
+                this.change_structure(CellChange::MoveUp, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveCellDown, window, cx| {
+                this.change_structure(CellChange::MoveDown, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DeleteCell, window, cx| {
+                this.change_structure(CellChange::Delete, window, cx)
+            }))
+            .when(self.notebook_mode == NotebookMode::Command, |this| {
+                this.on_action(
+                    cx.listener(|this, _: &Undo, window, cx| {
+                        this.undo_structure(false, window, cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &Redo, window, cx| this.undo_structure(true, window, cx)),
+                )
+            })
             .on_action(cx.listener(|this, action, window, cx| {
                 this.select_next(action, SelectionMode::SelectOnly, window, cx)
             }))
@@ -1332,15 +1704,19 @@ impl Render for NotebookEditor {
                 cx.listener(|this, action, window, cx| this.interrupt_kernel(action, window, cx)),
             )
             .when_some(
-                self.sync_errors.values().next().cloned(),
+                self.structure_error
+                    .as_ref()
+                    .or_else(|| self.sync_errors.values().next())
+                    .cloned(),
                 |container, error| container.child(Label::new(error).color(Color::Error)),
             )
+            .child(self.render_cell_controls())
             .child(if self.cell_order.is_empty() {
                 div()
                     .flex_1()
                     .p_4()
                     .child(Label::new(
-                        "This notebook is empty. Use Edit Source to add a cell.",
+                        "This notebook is empty. Add a code or Markdown cell to get started.",
                     ))
                     .into_any_element()
             } else {
@@ -1457,16 +1833,7 @@ impl NotebookItem {
     ) -> Option<Entity<Self>> {
         let id = project.read(cx).entry_for_path(&path, cx)?.id;
         let languages = project.read(cx).languages().clone();
-        let fields = parsed
-            .fields
-            .into_iter()
-            .map(|fields| {
-                fields.map_offsets(|range| {
-                    buffer.read(cx).anchor_before(range.start)
-                        ..buffer.read(cx).anchor_after(range.end)
-                })
-            })
-            .collect();
+        let fields = anchor_fields(parsed.fields, buffer.read(cx));
         Some(cx.new(|_| Self {
             project_path: path,
             id,
@@ -1476,6 +1843,20 @@ impl NotebookItem {
             notebook: parsed.notebook,
         }))
     }
+}
+
+fn anchor_fields(
+    fields: Vec<CellFields<usize>>,
+    buffer: &language::Buffer,
+) -> Vec<CellFields<language::Anchor>> {
+    fields
+        .into_iter()
+        .map(|fields| {
+            fields.map_offsets(|range| {
+                buffer.anchor_before(range.start)..buffer.anchor_after(range.end)
+            })
+        })
+        .collect()
 }
 
 impl KernelSession for NotebookKernelSession {
@@ -2156,6 +2537,64 @@ mod tests {
                 value["cells"][0]["outputs"],
                 json!([{"output_type":"stream","name":"stdout","text":"from this request\n"}])
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn moving_a_queued_cell_keeps_its_output_with_its_source(cx: &mut TestAppContext) {
+        use jupyter_protocol::{ExecuteReply, Status, StreamContent};
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(NOTEBOOK_WITH_ONE_CODE_CELL).unwrap();
+        fixture["nbformat_minor"] = json!(4);
+        fixture["cells"][0].as_object_mut().unwrap().remove("id");
+        let mut second = fixture["cells"][0].clone();
+        second["source"] = json!("print('second')");
+        fixture["cells"].as_array_mut().unwrap().push(second);
+        let (editor, cx) = kernel_test_editor(&fixture.to_string(), cx).await;
+        trust_notebook(&editor, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            let request: JupyterMessage = ExecuteRequest::default().into();
+            let Some(Cell::Code(cell)) = editor.cell(0) else {
+                panic!("missing code cell")
+            };
+            let run = CellExecution::queued(cell, cell.read(cx).current_source(cx), cx);
+            editor
+                .execution_requests
+                .insert(request.header.msg_id.clone(), run);
+            editor
+                .edit_structure(CellChange::MoveDown, window, cx)
+                .unwrap();
+            assert!(
+                editor
+                    .edit_structure(CellChange::Delete, window, cx)
+                    .is_err()
+            );
+            editor.selected_cell_index = 0;
+            editor
+                .edit_structure(CellChange::InsertMarkdown, window, cx)
+                .unwrap();
+            editor
+                .edit_structure(CellChange::Delete, window, cx)
+                .unwrap();
+            for message in [
+                StreamContent::stdout("first cell").as_child_of(&request),
+                ExecuteReply {
+                    execution_count: 12.into(),
+                    ..Default::default()
+                }
+                .as_child_of(&request),
+                Status::idle().as_child_of(&request),
+            ] {
+                editor.route_message(&message, window, cx).unwrap();
+            }
+            let saved: serde_json::Value =
+                serde_json::from_str(&editor.notebook_item.read(cx).buffer.read(cx).text())
+                    .unwrap();
+            assert_eq!(saved["cells"][0], fixture["cells"][1]);
+            assert_eq!(saved["cells"][1]["source"], fixture["cells"][0]["source"]);
+            assert_eq!(saved["cells"][1]["outputs"][0]["text"], "first cell");
+            assert_eq!(saved["cells"][1]["execution_count"], 12);
+            assert!(saved["cells"][1].get("id").is_none());
         });
     }
 
