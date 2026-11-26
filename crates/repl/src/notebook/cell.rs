@@ -386,8 +386,7 @@ fn new_cell_buffer(
     let buffer = cx.new(|cx| {
         let line_ending = match source.split_once('\n') {
             Some((first_line, _)) if first_line.ends_with('\r') => language::LineEnding::Windows,
-            Some(_) => language::LineEnding::Unix,
-            None => language::LineEnding::default(),
+            _ => language::LineEnding::Unix,
         };
         let mut source = source.to_owned();
         language::LineEnding::normalize(&mut source);
