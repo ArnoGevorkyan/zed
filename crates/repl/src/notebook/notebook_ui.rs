@@ -362,9 +362,8 @@ impl NotebookEditor {
         self.kernel_task.take();
         self.kernel_session = None;
         self.kernel = Kernel::Shutdown;
-        self.kernel_notice = (!self.execution_requests.is_empty()).then(|| {
-            "Kernel stopped. Incomplete runs were discarded; previous results are unchanged.".into()
-        });
+        self.kernel_notice = (!self.execution_requests.is_empty())
+            .then(|| "Kernel stopped. Your previous results are unchanged.".into());
         self.display_slots.clear();
         for (_, run) in self.execution_requests.drain() {
             if let Some(Cell::Code(cell)) = self.cell_map.get(&run.cell_id) {
@@ -589,7 +588,7 @@ impl NotebookEditor {
             return;
         }
         if self.kernel_task.is_some() {
-            self.kernel_notice = Some("Kernel setup is in progress. This cell was not queued; run it again when the kernel is ready.".into());
+            self.kernel_notice = Some("Cell not queued. Run it again after kernel setup.".into());
             cx.notify();
             return;
         }
@@ -640,7 +639,7 @@ impl NotebookEditor {
                         .cell_map
                         .get(&run.cell_id)
                         .is_some_and(|cell| cell.current_source(cx) == run.source),
-                    "The cell changed. Run it again to execute its current source."
+                    "The cell changed. Run it again."
                 );
             }
             Ok(())
@@ -695,7 +694,7 @@ impl NotebookEditor {
                     editor.kernel_notice = Some(reason.clone());
                     cx.notify();
                     window.prompt(gpui::PromptLevel::Info, "Set up Python for notebooks?",
-                        Some(&format!("{reason}\n\nZed can download a private Python environment with ipykernel and matplotlib for running cells and basic plots. Your project's Python environment will not change.")),
+                        Some(&format!("{reason}\n\nZed will download a private Python environment with ipykernel and matplotlib. This won't change your project's Python environment.")),
                         &["Set Up Python", "Cancel"], cx)
                 })?;
             if consent.await.ok() != Some(0) {
