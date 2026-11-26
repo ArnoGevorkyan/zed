@@ -358,7 +358,9 @@ impl NotebookEditor {
         self.kernel_task.take();
         self.kernel_session = None;
         self.kernel = Kernel::Shutdown;
-        self.kernel_notice = None;
+        self.kernel_notice = (!self.execution_requests.is_empty()).then(|| {
+            "Kernel stopped. Incomplete runs were discarded; previous results are unchanged.".into()
+        });
         self.display_slots.clear();
         for (_, run) in self.execution_requests.drain() {
             if let Some(Cell::Code(cell)) = self.cell_map.get(&run.cell_id) {
@@ -700,7 +702,8 @@ impl NotebookEditor {
 
     fn restart_kernel(&mut self, _: &RestartKernel, _window: &mut Window, cx: &mut Context<Self>) {
         self.stop_kernel(cx);
-        self.kernel_notice = Some("Kernel stopped. Run a cell to start a new session.".into());
+        self.kernel_notice
+            .get_or_insert_with(|| "Kernel stopped. Run a cell to start a new session.".into());
     }
 
     fn interrupt_kernel(
@@ -1653,7 +1656,7 @@ impl NotebookEditor {
         let reply = run.reply.take().context("Missing kernel reply")?;
         anyhow::ensure!(
             reply.status != jupyter_protocol::ReplyStatus::Aborted,
-            "The kernel aborted this cell without executing it."
+            "The kernel aborted this cell before it ran. Its previous results are unchanged."
         );
         self.check_execution(cx)?;
         let index = self
@@ -1993,6 +1996,13 @@ mod tests {
             assert_visible_result("partial\n", 2, cx);
             editor.stop_kernel(cx);
             assert_visible_result("saved\n", 17, cx);
+            assert!(
+                editor
+                    .kernel_notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("previous results are unchanged")
+            );
             assert!(!cell.read(cx).is_executing());
             assert_eq!(cell.read(cx).execution_duration(), None);
             assert_eq!(buffer.read(cx).text(), after_abort);
