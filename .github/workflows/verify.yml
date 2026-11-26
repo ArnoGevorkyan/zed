@@ -1,7 +1,7 @@
-name: Verify first-run Python setup in delivered ZIP
+name: Exercise notebook scrolling on hosted Windows
 on:
   push:
-    branches: [capy/arn23-hosted-first-run]
+    branches: [capy/verify-notebook-scroll-win]
 permissions:
   actions: read
   contents: read
@@ -27,11 +27,12 @@ jobs:
           if ((Get-FileHash $zip).Hash -ne '98BD7ADC2F85C1971CA735AA3CA8D3C265DA483A254F65F95D8F579B2810177E') { throw 'Wrong ZIP' }
           Expand-Archive $zip "$env:RUNNER_TEMP\preview"
           if ((Get-FileHash "$env:RUNNER_TEMP\preview\Zed.exe").Hash -ne 'A620A96E1D76A15FA9B782AC07F365EDAD4C4194C58A30DDE7083523AA48BA4A') { throw 'Wrong executable' }
-          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -STA -NoProfile -File ./verify.ps1
+          python -m pip install pillow==11.3.0
+          python ./exercise.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: first-run-proof
+          name: scroll-interactions
           path: ${{ runner.temp }}/proof
           retention-days: 7
