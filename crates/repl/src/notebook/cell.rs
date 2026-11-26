@@ -1453,6 +1453,59 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn drag_wide_notebook_output(cx: &mut TestAppContext) {
+        use crate::notebook::{
+            NotebookPreview,
+            preview::preview_tests::{notebook_workspace, open_file},
+        };
+        use gpui::{Modifiers, MouseButton, point, size};
+        use serde_json::json;
+        let file = json!({"nbformat":4, "nbformat_minor":5, "metadata":{}, "cells":[{
+            "cell_type":"code", "id":"wide", "metadata":{}, "source":"x", "execution_count":1,
+            "outputs":[{"output_type":"stream", "name":"stdout", "text":"x".repeat(90)}]
+        }]})
+        .to_string();
+        let (_, workspace, cx) = notebook_workspace(json!({"wide.ipynb": file}), cx).await;
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.scrollbar.get_or_insert_default().show =
+                        Some(settings::ShowScrollbar::Always);
+                });
+            })
+        });
+        cx.simulate_resize(size(px(500.), px(640.)));
+        open_file("wide.ipynb", &workspace, cx).await;
+        let scroll = workspace.read_with(cx, |workspace, cx| {
+            let tab = workspace.active_item_as::<NotebookPreview>(cx).unwrap();
+            let notebook = tab.read(cx).notebook.as_ref().unwrap().read(cx);
+            let Some(Cell::Code(cell)) = notebook.cell(0) else {
+                panic!("expected code cell")
+            };
+            cell.read(cx).output_scroll.clone()
+        });
+        assert!(scroll.max_offset().x > px(0.));
+        let viewport = scroll.bounds();
+        let thumb = point(viewport.left() + px(10.), viewport.bottom() + px(7.));
+        let right = point(viewport.right(), thumb.y);
+        let modifiers = Modifiers::none();
+        cx.simulate_mouse_down(thumb, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(right, MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(right, MouseButton::Left, modifiers);
+        assert!(
+            (scroll.offset().x + scroll.max_offset().x).abs() <= px(1.),
+            "dragging the thumb exposes the last output column"
+        );
+        cx.simulate_resize(size(px(1800.), px(640.)));
+        cx.run_until_parked();
+        assert_eq!(
+            scroll.max_offset().x,
+            px(0.),
+            "fitting output has no scroll range"
+        );
+    }
+
+    #[gpui::test]
     fn test_notebook_static_outputs(cx: &mut TestAppContext) {
         init_test(cx);
         let languages = Arc::new(LanguageRegistry::test(cx.executor()));
