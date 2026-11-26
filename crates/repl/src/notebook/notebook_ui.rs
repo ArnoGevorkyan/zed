@@ -267,6 +267,16 @@ impl NotebookEditor {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        cx.on_focus(&focus_handle, window, |notebook, window, cx| {
+            if notebook.notebook_mode == NotebookMode::Edit
+                && let Some(editor) = notebook
+                    .get_selected_cell()
+                    .and_then(|cell| cell.editor(cx))
+            {
+                editor.focus_handle(cx).focus(window, cx);
+            }
+        })
+        .detach();
 
         let worktree_id = notebook_item.read(cx).project_path.worktree_id;
 

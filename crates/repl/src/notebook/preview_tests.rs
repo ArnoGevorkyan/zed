@@ -158,11 +158,7 @@ async fn tab_return_restores_the_cell_selection_and_notebook_mode(cx: &mut TestA
     open_file("beta.ipynb", &workspace, cx).await;
     cx.dispatch_action(ActivatePreviousItem::default());
     cx.simulate_keystrokes("x");
-    assert!(
-        cell_sources(&workspace, cx)
-            .iter()
-            .any(|source| source == "ax")
-    );
+    assert_eq!(cell_sources(&workspace, cx)[1], "ax");
 
     cx.dispatch_action(ActivateNextItem::default());
     cx.simulate_keystrokes("y");
@@ -184,11 +180,7 @@ async fn discarding_a_notebook_closes_its_tab(cx: &mut TestAppContext) {
     cx.dispatch_action(workspace::pane::CloseActiveItem::default());
     cx.simulate_prompt_answer("Cancel");
     cx.run_until_parked();
-    assert!(
-        cell_sources(&workspace, cx)
-            .iter()
-            .any(|source| source == "x")
-    );
+    assert_eq!(cell_sources(&workspace, cx)[1], "x");
 
     cx.dispatch_action(workspace::pane::CloseActiveItem::default());
     cx.simulate_prompt_answer("Don't Save");
@@ -200,6 +192,36 @@ async fn discarding_a_notebook_closes_its_tab(cx: &mut TestAppContext) {
             .items_len()),
         0
     );
+    assert_eq!(
+        fs.load(Path::new(path!("/notebooks/field.ipynb")))
+            .await
+            .unwrap(),
+        NOTEBOOK
+    );
+}
+
+#[gpui::test]
+async fn closing_notebook_cells_keeps_an_independent_source_view(cx: &mut TestAppContext) {
+    let (fs, workspace, cx) = notebook_workspace(json!({"field.ipynb": NOTEBOOK}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    cx.dispatch_action(EditSource);
+    cx.dispatch_action(workspace::pane::SplitRight::default());
+    cx.dispatch_action(OpenNotebook);
+    cx.run_until_parked();
+    cx.dispatch_action(AddCodeBlock);
+    cx.simulate_keystrokes("x");
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    cx.run_until_parked();
+    assert!(cx.pending_prompt().is_none());
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(workspace.panes().len(), 1);
+        let source = workspace
+            .active_item_as::<Editor>(cx)
+            .expect("independent source");
+        let contents: Value = serde_json::from_str(&source.read(cx).text(cx)).unwrap();
+        assert_eq!(contents["cells"][1]["source"], json!(["x"]));
+        assert!(source.is_dirty(cx));
+    });
     assert_eq!(
         fs.load(Path::new(path!("/notebooks/field.ipynb")))
             .await

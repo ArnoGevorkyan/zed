@@ -251,7 +251,11 @@ impl NotebookPreview {
                     this.editor.read(cx).active_project_path(cx).as_ref()
                         != Some(notebook.read(cx).project_path(cx))
                 });
-            if external_edit || changed_file || matches!(event, EditorEvent::CapabilityChanged) {
+            if !this.restore_source
+                && (external_edit
+                    || changed_file
+                    || matches!(event, EditorEvent::CapabilityChanged))
+            {
                 this.restore_source = true;
                 this.show_source(false, window, cx);
             }
@@ -497,6 +501,10 @@ impl Item for NotebookPreview {
     ) -> Task<Result<()>> {
         self.editor
             .update(cx, |editor, cx| editor.reload(project, window, cx))
+    }
+
+    fn discard_before_close(&mut self, _: &mut Context<Self>) {
+        self.restore_source = true;
     }
 
     fn added_to_workspace(
