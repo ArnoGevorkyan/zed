@@ -286,7 +286,7 @@ impl NotebookPreview {
     fn show_source(&self, explicit: bool, window: &mut Window, cx: &mut Context<Self>) {
         let preview = cx.entity();
         let editor = self.editor.clone();
-        let notebook = self.notebook.clone().filter(|_| explicit);
+        let notebook = self.notebook.clone().filter(|_| !self.restore_source);
         let workspace = self.workspace.clone();
         window.defer(cx, move |window, cx| {
             let Some(workspace) = workspace.upgrade() else {

@@ -636,6 +636,38 @@ async fn switching_to_source_preserves_cell_undo_until_the_raw_file_changes(
         code(cx).read_with(cx, |editor, cx| editor.text(cx)),
         "cell edit"
     );
+    workspace.update_in(cx, |workspace, window, cx| {
+        let item = workspace.active_item(cx).unwrap();
+        editor::items::navigate_to_file_position(item.as_ref(), 5, Some(1), true, window, cx);
+    });
+    cx.run_until_parked();
+    let positioned = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<Editor>(cx).unwrap()
+    });
+    positioned.update(cx, |editor, cx| {
+        let point = editor
+            .selections
+            .newest::<language::Point>(&editor.display_snapshot(cx))
+            .head();
+        assert_eq!(point, language::Point::new(4, 0));
+    });
+    cx.dispatch_action(OpenNotebook);
+    cx.run_until_parked();
+    code(cx).update_in(cx, |editor, window, cx| {
+        editor.undo(&editor::actions::Undo, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        code(cx).read_with(cx, |editor, cx| editor.text(cx)),
+        "print('from source')"
+    );
+    assert!(!workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item(cx).unwrap().is_dirty(cx)
+    }));
+    code(cx).update_in(cx, |editor, window, cx| {
+        editor.redo(&editor::actions::Redo, window, cx)
+    });
+    cx.run_until_parked();
     cx.dispatch_action(EditSource);
     cx.run_until_parked();
     let source = workspace.read_with(cx, |workspace, cx| {
