@@ -2842,9 +2842,23 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
         assert_eq!(list.logical_scroll_top(), stopped, "Escape stops scrolling");
+        cx.simulate_event(gpui::ScrollEvent {
+            position: origin,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), list.max_offset_for_scrollbar().y)),
+            ..Default::default()
+        });
+        assert_eq!(
+            list.scroll_px_offset_for_scrollbar().y,
+            px(0.),
+            "wheel returns to the top"
+        );
         let thumb = point(bounds.right() - px(7.), bounds.top() + px(10.));
         let bottom = point(thumb.x, bounds.bottom() - px(1.));
         cx.simulate_mouse_down(thumb, MouseButton::Left, modifiers);
+        assert!(
+            list.is_scrollbar_dragging(),
+            "the page thumb captured the press"
+        );
         cx.simulate_mouse_move(bottom, MouseButton::Left, modifiers);
         cx.simulate_mouse_up(bottom, MouseButton::Left, modifiers);
         assert!(
