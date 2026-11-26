@@ -1,0 +1,41 @@
+name: Verify candidate notebook scrolling on hosted Windows
+on:
+  push:
+    branches: [capy/verify-notebook-scroll-win]
+    paths: ['.github/workflows/verify-candidate.yml']
+permissions:
+  actions: read
+  contents: read
+jobs:
+  desktop:
+    if: github.repository == 'ArnoGevorkyan/zed'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      SCROLL_CANDIDATE: '1'
+      PRODUCT: 33adfba3884c48b2fa7f8c303b7dc01f489b7061
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45881279264
+          name: scroll-payload
+          path: ${{ runner.temp }}/preview
+      - name: Exercise the pinned notebook build on a fresh hosted desktop
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_ARCH -ne 'X64' -or (Test-Path crates)) { throw 'Expected a clean hosted Windows x64 desktop' }
+          Get-Content "$env:RUNNER_TEMP/preview/BUILD.txt"
+          python -c "import mmap,os,pathlib; f=(pathlib.Path(os.environ['RUNNER_TEMP'])/'preview/Zed.exe').open('rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); assert m.find(os.environ['PRODUCT'].encode()) >= 0"
+          if ($LASTEXITCODE) { throw 'Unexpected executable revision' }
+          python -m pip install pillow==11.3.0
+          python ./exercise.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: candidate-scroll-interactions
+          path: ${{ runner.temp }}/proof
+          retention-days: 14
