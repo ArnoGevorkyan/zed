@@ -333,6 +333,7 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     ) -> Task<Result<()>> {
         unimplemented!("reload() must be implemented if can_save() returns true")
     }
+    fn discard_before_close(&mut self, _: &mut Context<Self>) {}
 
     fn act_as_type<'a>(
         &'a self,
@@ -563,6 +564,7 @@ pub trait ItemHandle: 'static + Send {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<()>>;
+    fn discard_before_close(&self, cx: &mut App);
     fn act_as_type(&self, type_id: TypeId, cx: &App) -> Option<AnyEntity>;
     fn to_followable_item_handle(&self, cx: &App) -> Option<Box<dyn FollowableItemHandle>>;
     fn to_serializable_item_handle(&self, cx: &App) -> Option<Box<dyn SerializableItemHandle>>;
@@ -1133,6 +1135,10 @@ impl<T: Item> ItemHandle for Entity<T> {
         cx: &mut App,
     ) -> Task<Result<()>> {
         self.update(cx, |item, cx| item.reload(project, window, cx))
+    }
+
+    fn discard_before_close(&self, cx: &mut App) {
+        self.update(cx, |item, cx| item.discard_before_close(cx));
     }
 
     fn act_as_type<'a>(&'a self, type_id: TypeId, cx: &'a App) -> Option<AnyEntity> {
