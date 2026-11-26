@@ -70,6 +70,7 @@ pub struct NotebookEditor {
     kernel_specification: Option<LocalKernelSpecification>,
     kernel_session: Option<Entity<NotebookKernelSession>>,
     kernel_task: Option<Shared<Task<()>>>,
+    preparing_cell: Option<CellId>,
     kernel_notice: Option<String>,
     execution_requests: HashMap<String, CellExecution>,
     display_slots: HashMap<CellId, DisplaySlots>,
@@ -294,6 +295,7 @@ impl NotebookEditor {
             display_slots: HashMap::default(),
             kernel_session: None,
             kernel_task: None,
+            preparing_cell: None,
             kernel_notice: None,
         };
         for cell in cells {
@@ -410,6 +412,7 @@ impl NotebookEditor {
 
     pub(super) fn stop_kernel(&mut self, cx: &mut Context<Self>) {
         self.kernel_task.take();
+        self.preparing_cell = None;
         self.kernel_session = None;
         self.kernel = Kernel::Shutdown;
         self.kernel_notice = (!self.execution_requests.is_empty())
@@ -649,12 +652,14 @@ impl NotebookEditor {
             return;
         }
         let selected = run.as_ref().and(self.kernel_specification.clone());
+        self.preparing_cell = run.as_ref().map(|run| run.cell_id.clone());
         let fs = self.project.read(cx).fs().clone();
         self.kernel_notice = Some("Finding a Python kernel…".into());
         let prepare = cx.spawn_in(window, async move |this, cx| {
             let result = Self::prepare_kernel(&this, selected, fs, run.as_ref(), cx).await;
             this.update_in(cx, |editor, window, cx| {
                 editor.kernel_task = None;
+                editor.preparing_cell = None;
                 editor.kernel_notice = result.err().map(|error| {
                     error
                         .chain()
@@ -1028,8 +1033,8 @@ impl NotebookEditor {
                 "This cell is queued or running. Wait for it to finish or stop the kernel before deleting it."
             );
             anyhow::ensure!(
-                self.kernel_task.is_none(),
-                "Wait for kernel setup before deleting a cell."
+                self.preparing_cell.as_ref() != Some(id),
+                "Wait for this cell’s kernel setup to finish before deleting it."
             );
             if let Some(Cell::Code(cell)) = self.cell_map.get(id)
                 && cell.read(cx).has_stale_outputs(cx)
@@ -1078,9 +1083,7 @@ impl NotebookEditor {
                 cell,
                 fields,
             } => {
-                let fields = fields.map_offsets(|r| {
-                    buffer.read(cx).anchor_before(r.start)..buffer.read(cx).anchor_after(r.end)
-                });
+                let fields = anchor_fields(fields, buffer.read(cx));
                 self.notebook_item
                     .update(cx, |item, _| item.fields.insert(index, fields));
                 self.load_cell(&cell, window, cx);
@@ -1815,7 +1818,11 @@ impl NotebookItem {
     ) -> Option<Entity<Self>> {
         let id = project.read(cx).entry_for_path(&path, cx)?.id;
         let languages = project.read(cx).languages().clone();
-        let fields = anchor_fields(parsed.fields, buffer.read(cx));
+        let fields = parsed
+            .fields
+            .into_iter()
+            .map(|fields| anchor_fields(fields, buffer.read(cx)))
+            .collect();
         Some(cx.new(|_| Self {
             project_path: path,
             id,
@@ -1828,17 +1835,10 @@ impl NotebookItem {
 }
 
 fn anchor_fields(
-    fields: Vec<CellFields<usize>>,
+    fields: CellFields<usize>,
     buffer: &language::Buffer,
-) -> Vec<CellFields<language::Anchor>> {
-    fields
-        .into_iter()
-        .map(|fields| {
-            fields.map_offsets(|range| {
-                buffer.anchor_before(range.start)..buffer.anchor_after(range.end)
-            })
-        })
-        .collect()
+) -> CellFields<language::Anchor> {
+    fields.map_offsets(|range| buffer.anchor_before(range.start)..buffer.anchor_after(range.end))
 }
 
 impl KernelSession for NotebookKernelSession {
@@ -2536,6 +2536,21 @@ mod tests {
         trust_notebook(&editor, cx);
         editor.update_in(cx, |editor, window, cx| {
             let request: JupyterMessage = ExecuteRequest::default().into();
+            editor.preparing_cell = editor.cell_order.first().cloned();
+            editor.change_structure(CellChange::Delete, window, cx);
+            assert!(
+                editor
+                    .structure_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("kernel setup")
+            );
+            editor.selected_cell_index = 1;
+            editor.change_structure(CellChange::Delete, window, cx);
+            assert_eq!(editor.cell_count(), 1);
+            editor.undo_structure(false, window, cx);
+            editor.selected_cell_index = 0;
+            editor.preparing_cell = None;
             let Some(Cell::Code(cell)) = editor.cell(0) else {
                 panic!("missing code cell")
             };
@@ -2576,6 +2591,15 @@ mod tests {
             assert_eq!(saved["cells"][1]["outputs"][0]["text"], "first cell");
             assert_eq!(saved["cells"][1]["execution_count"], 12);
             assert!(saved["cells"][1].get("id").is_none());
+            for _ in 0..3 {
+                editor.undo_structure(false, window, cx);
+                assert!(editor.structure_error.is_none());
+            }
+            let restored: serde_json::Value =
+                serde_json::from_str(&editor.notebook_item.read(cx).buffer.read(cx).text())
+                    .unwrap();
+            assert_eq!(restored["cells"][0], saved["cells"][1]);
+            assert_eq!(restored["cells"][1], fixture["cells"][1]);
         });
     }
 
