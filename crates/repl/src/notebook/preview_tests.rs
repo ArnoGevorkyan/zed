@@ -145,6 +145,70 @@ fn cell_sources(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Ve
 }
 
 #[gpui::test]
+async fn tab_return_restores_the_cell_selection_and_notebook_mode(cx: &mut TestAppContext) {
+    use workspace::pane::{ActivateNextItem, ActivatePreviousItem};
+    use zed_actions::notebook::EnterEditMode;
+
+    let (_, workspace, cx) =
+        notebook_workspace(json!({"alpha.ipynb": NOTEBOOK, "beta.ipynb": NOTEBOOK}), cx).await;
+    open_file("alpha.ipynb", &workspace, cx).await;
+    cx.dispatch_action(AddCodeBlock);
+    cx.simulate_keystrokes("a b");
+    cx.dispatch_action(editor::actions::SelectLeft);
+    open_file("beta.ipynb", &workspace, cx).await;
+    cx.dispatch_action(ActivatePreviousItem::default());
+    cx.simulate_keystrokes("x");
+    assert!(
+        cell_sources(&workspace, cx)
+            .iter()
+            .any(|source| source == "ax")
+    );
+
+    cx.dispatch_action(ActivateNextItem::default());
+    cx.simulate_keystrokes("y");
+    assert_eq!(
+        cell_sources(&workspace, cx)[0],
+        "# Field notes\n![sample](attachment:sample.png)"
+    );
+    cx.dispatch_action(EnterEditMode);
+    cx.simulate_keystrokes("y");
+    assert!(cell_sources(&workspace, cx)[0].starts_with("y# Field notes"));
+}
+
+#[gpui::test]
+async fn discarding_a_notebook_closes_its_tab(cx: &mut TestAppContext) {
+    let (fs, workspace, cx) = notebook_workspace(json!({"field.ipynb": NOTEBOOK}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    cx.dispatch_action(AddCodeBlock);
+    cx.simulate_keystrokes("x");
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert!(
+        cell_sources(&workspace, cx)
+            .iter()
+            .any(|source| source == "x")
+    );
+
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    cx.simulate_prompt_answer("Don't Save");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace.read_with(cx, |workspace, cx| workspace
+            .active_pane()
+            .read(cx)
+            .items_len()),
+        0
+    );
+    assert_eq!(
+        fs.load(Path::new(path!("/notebooks/field.ipynb")))
+            .await
+            .unwrap(),
+        NOTEBOOK
+    );
+}
+
+#[gpui::test]
 async fn author_cells_in_an_empty_restricted_notebook(cx: &mut TestAppContext) {
     let original = r#"{"nbformat":4, "nbformat_minor":5, "metadata":{}, "cells":[ ]}"#;
     let (fs, workspace, cx) = notebook_workspace(json!({"field.ipynb": original}), cx).await;
