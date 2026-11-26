@@ -1,0 +1,22 @@
+Zed notebook preview for Windows x64
+====================================
+
+Extract the entire ZIP. In PowerShell, change to the folder containing Zed.exe:
+
+    $profileDir = Join-Path $env:TEMP ("zed-notebook-" + [guid]::NewGuid())
+    .\Zed.exe --user-data-dir "$profileDir" ".\Notebook.ipynb"
+
+The saved chart opens without Python. Stay in Restricted Mode to view the example.
+To execute it, trust only your own notebook/workspace, then use Run All
+(Ctrl+Shift+Enter). The example needs a local Python environment with
+ipykernel and Pillow to execute. No Python or kernel is included. Run All
+changes the outputs; save a copy if you want to keep the original example.
+
+This standalone, unsigned development build needs no installer and does not
+replace installed Zed. Only run it if you trust this fork and have checked
+the published SHA-256. Do not turn off Windows security features.
+--user-data-dir separates the profile; Windows can still update its Jump List
+and Zed can use its shared LocalAppData cache. After quitting this copy, you
+can remove the extracted folder and the temporary profile you created.
+This bundle is for the notebook preview, not an official distribution:
+no PATH/file associations, Explorer integration, auto-updater or CLI helper.

@@ -1,0 +1,62 @@
+name: Smoke portable notebook ZIP
+on:
+  push:
+    branches: [capy/arn20-portable-smoke]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    if: github.repository == 'ArnoGevorkyan/zed'
+    runs-on: windows-2022
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - name: Require a fresh hosted x64 runner without product sources
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_ARCH -ne 'X64' -or (Test-Path 'crates') -or (Test-Path 'assets')) { throw 'Expected clean hosted Windows without product sources' }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          run-id: 45870655441
+          github-token: ${{ github.token }}
+          name: arn20-payload
+          path: payload
+      - name: Zip and extract the user package
+        run: |
+          Copy-Item Notebook.ipynb,TRY-ME.txt payload
+          Compress-Archive payload/* Zed-notebook-win-x64.zip
+          $hash = (Get-FileHash Zed-notebook-win-x64.zip).Hash
+          "$hash  Zed-notebook-win-x64.zip" | Set-Content SHA256.txt
+          Get-Content SHA256.txt
+          Expand-Archive Zed-notebook-win-x64.zip "$env:RUNNER_TEMP\Zed notebook"
+          $exe = "$env:RUNNER_TEMP\Zed notebook\Zed.exe"
+          $file = [System.IO.File]::OpenRead($exe)
+          $reader = [System.IO.BinaryReader]::new($file)
+          $file.Position = 60
+          $file.Position = $reader.ReadInt32()
+          if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) { throw 'Not a Windows x64 executable' }
+          $reader.Close()
+          if ((Get-AuthenticodeSignature $exe).Status -ne 'NotSigned') { throw 'Unexpected signature state' }
+          python -c "import mmap,sys; f=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); assert b'951330f9cbee1bd698e01ddea460f797d6409e91' in m" "$exe"
+          if ($LASTEXITCODE) { throw 'Embedded product revision not found' }
+          Remove-Item payload -Recurse -Force
+      - name: Launch the extracted preview outside the build tree
+        run: |
+          ./smoke.ps1 -PackageDir "$env:RUNNER_TEMP\Zed notebook" -EvidenceDir "$env:RUNNER_TEMP\proof"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: hosted-preview-evidence
+          path: ${{ runner.temp }}/proof
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: Zed-notebook-win-x64
+          path: |
+            Zed-notebook-win-x64.zip
+            SHA256.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
