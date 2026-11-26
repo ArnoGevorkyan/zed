@@ -1132,19 +1132,11 @@ impl CodeCell {
         };
         let output_max_width =
             plain::max_width_for_columns(ReplSettings::get_global(cx).max_columns, window, cx);
-        let content = v_flex()
-            .flex_none()
-            .min_w_full()
-            .children(self.outputs.iter().filter_map(|output| {
-                let content = output.content(window, cx)?;
-                Some(if matches!(output, Output::Markdown { .. }) {
-                    preserve_middle_click(div(), cx)
-                        .child(content)
-                        .into_any_element()
-                } else {
-                    content
-                })
-            }));
+        let content = v_flex().flex_none().min_w_full().children(
+            self.outputs
+                .iter()
+                .filter_map(|output| output.content(window, cx)),
+        );
         let horizontal = div()
             .id("output-scroll")
             .flex()
