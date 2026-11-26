@@ -18,6 +18,16 @@ Zed's built-in REPL uses [Jupyter kernels](https://docs.jupyter.org/en/latest/pr
     </video>
 </figure>
 
+## Python notebooks in this fork
+
+Open an existing version 4 `.ipynb` file to edit its Markdown and Python cells. You can edit, save, and view stored text and PNG plots offline, without Python. If a tab already shows JSON, choose **Open Notebook Editor** from its tab menu. **Edit Source** takes you back to the same file, including unsaved edits.
+
+In a trusted local project, use the play button beside a Python cell to run it. Cells share one kernel until you stop it or close the notebook. Use **Select Kernel** to choose a different local interpreter. If no usable kernel is available, **Set Up Python** downloads a private Python environment with ipykernel and matplotlib. You can cancel and keep editing. Zed does not install packages based on notebook imports; select a project environment for other dependencies.
+
+Save after a run to keep its output and execution count. Reopening the file shows saved results without executing code. The cell editor does not run rich HTML, JavaScript, or widgets. To add, delete, or reorder cells, use **Edit Source** or another notebook editor. These structural commands from the earlier notebook experiment are not part of this editor.
+
+To view a notebook in two panes, choose **Edit Source**, split the JSON editor, then choose **Open Notebook Editor** in one pane. Switching to source stops the kernel. If the JSON file itself mixes LF and CRLF line endings, saving normalizes them as it does in Zed’s text editor.
+
 ## Installation
 
 Zed supports running code in multiple languages. To get started, you need to install a kernel for the language you want to use.

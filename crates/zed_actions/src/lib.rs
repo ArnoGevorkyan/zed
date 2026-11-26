@@ -944,7 +944,7 @@ pub mod notebook {
     actions!(
         notebook,
         [
-            /// Opens the current Jupyter notebook as a cell preview.
+            /// Opens the current Jupyter notebook as editable cells.
             OpenNotebook,
             /// Returns to the notebook's JSON source.
             EditSource,

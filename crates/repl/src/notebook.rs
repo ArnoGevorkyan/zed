@@ -1,4 +1,6 @@
 mod cell;
+mod document;
+pub(crate) mod kernel_setup;
 mod notebook_ui;
 mod preview;
 pub use cell::*;

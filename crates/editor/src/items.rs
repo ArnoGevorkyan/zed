@@ -74,6 +74,9 @@ use zed_actions::preview::{
 
 pub const MAX_TAB_TITLE_LEN: usize = 24;
 
+pub struct SourceLocationRequested;
+impl EventEmitter<SourceLocationRequested> for Editor {}
+
 impl FollowableItem for Editor {
     fn remote_id(&self) -> Option<ViewId> {
         self.remote_id
@@ -635,6 +638,15 @@ fn deserialize_anchor(anchor: proto::EditorAnchor, buffer: &MultiBufferSnapshot)
 
 impl Item for Editor {
     type Event = EditorEvent;
+
+    fn reveal_source(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Box<dyn workspace::item::ItemHandle> {
+        cx.emit(SourceLocationRequested);
+        Box::new(cx.entity())
+    }
 
     fn act_as_type<'a>(
         &'a self,
@@ -1241,7 +1253,7 @@ impl Item for Editor {
 
         if file_extension.is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb")) {
             actions.push((
-                "Open Notebook Preview".into(),
+                "Open Notebook Editor".into(),
                 Box::new(zed_actions::notebook::OpenNotebook),
             ));
         }
@@ -1470,23 +1482,9 @@ impl SerializableItem for Editor {
         closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        let buffer_serialization = self.buffer_serialization?;
         let project = self.project.clone()?;
-
-        let serialize_dirty_buffers = match buffer_serialization {
-            // Always serialize dirty buffers, including for worktree-less windows.
-            // This enables hot-exit functionality for empty windows and single files.
-            BufferSerialization::All => true,
-            BufferSerialization::NonDirtyBuffers => false,
-        };
-
-        if closing && !serialize_dirty_buffers {
-            return None;
-        }
-
         let workspace_id = workspace.database_id()?;
-
-        let buffer = self.buffer().read(cx).as_singleton()?;
+        let (buffer, dirty_snapshot) = self.buffer_for_session(closing, cx)?;
 
         let abs_path = buffer.read(cx).file().and_then(|file| {
             let worktree_id = file.worktree_id(cx);
@@ -1501,16 +1499,13 @@ impl SerializableItem for Editor {
                 })
         });
 
-        let is_dirty = buffer.read(cx).is_dirty();
         let mtime = buffer.read(cx).saved_mtime();
         let content_language_detection_enabled =
             buffer.read(cx).content_language_detection_enabled();
 
-        let snapshot = buffer.read(cx).snapshot();
-
         let db = EditorDb::global(cx);
         Some(cx.background_spawn(async move {
-            let (contents, language) = if serialize_dirty_buffers && is_dirty {
+            let (contents, language) = if let Some(snapshot) = dirty_snapshot {
                 let contents = snapshot.text();
                 let language = snapshot.language().and_then(|language| {
                     if content_language_detection_enabled && *language == *PLAIN_TEXT {
@@ -1636,6 +1631,21 @@ fn clip_ranges<'a>(
 impl EventEmitter<SearchEvent> for Editor {}
 
 impl Editor {
+    pub fn buffer_for_session(
+        &self,
+        closing: bool,
+        cx: &App,
+    ) -> Option<(Entity<Buffer>, Option<language::BufferSnapshot>)> {
+        let serialize_dirty = matches!(self.buffer_serialization?, BufferSerialization::All);
+        if closing && !serialize_dirty {
+            return None;
+        }
+        let buffer = self.buffer().read(cx).as_singleton()?;
+        let snapshot =
+            (serialize_dirty && buffer.read(cx).is_dirty()).then(|| buffer.read(cx).snapshot());
+        Some((buffer, snapshot))
+    }
+
     /// Panes keep increasing `detail` until tabs for files with the same name look different.
     pub fn tab_description(&self, detail: usize, cx: &App) -> Option<SharedString> {
         let path = path_for_buffer(&self.buffer, detail, false, cx)?;
@@ -2191,6 +2201,35 @@ pub fn active_match_index(
     }
 }
 
+pub fn navigate_to_file_position(
+    item: &dyn workspace::item::ItemHandle,
+    row: u32,
+    column: Option<u32>,
+    record_nav_history: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Box<dyn workspace::item::ItemHandle> {
+    let source = item.reveal_source(window, cx);
+    let Some(editor) = source.downcast::<Editor>() else {
+        return source;
+    };
+    editor.update(cx, |editor, cx| {
+        let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+            return;
+        };
+        let point = buffer.read(cx).snapshot().point_from_external_input(
+            row.saturating_sub(1),
+            column.unwrap_or(1).saturating_sub(1),
+        );
+        if record_nav_history {
+            editor.go_to_singleton_buffer_point(point, window, cx);
+        } else {
+            editor.go_to_singleton_buffer_point_silently(point, window, cx);
+        }
+    });
+    source
+}
+
 /// Opens a path-like target (e.g. `items.rs:100:5`) in the workspace, moving the cursor
 /// to the one-based row/column if present. Returns whether the target was opened.
 pub async fn open_resolved_target(
@@ -2230,22 +2269,17 @@ pub async fn open_resolved_target(
         };
         let opened_item =
             opened_item.with_context(|| format!("opening {:?}", path_to_open.path))?;
-        if let Some(row) = path_to_open.row
-            && let Some(editor) = opened_item.downcast::<Editor>()
-        {
-            let column = path_to_open.column.unwrap_or(0);
-            editor
-                .downgrade()
-                .update_in(cx, |editor, window, cx| {
-                    if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
-                        let point = buffer.read(cx).snapshot().point_from_external_input(
-                            row.saturating_sub(1),
-                            column.saturating_sub(1),
-                        );
-                        editor.go_to_singleton_buffer_point(point, window, cx);
-                    }
-                })
-                .log_err();
+        if let Some(row) = path_to_open.row {
+            cx.update(|window, cx| {
+                navigate_to_file_position(
+                    opened_item.as_ref(),
+                    row,
+                    path_to_open.column,
+                    true,
+                    window,
+                    cx,
+                )
+            })?;
         }
         Ok(true)
     } else if open_target.is_dir() {
@@ -2361,7 +2395,7 @@ fn path_for_file<'a>(
 /// This is somewhat wasteful since we load the whole buffer from disk then overwrite it,
 /// but keeps implementation simple as we don't need to persist all metadata from loading
 /// (git diff base, etc.).
-fn restore_serialized_buffer_contents(
+pub fn restore_serialized_buffer_contents(
     buffer: &mut Buffer,
     contents: String,
     mtime: Option<MTime>,
