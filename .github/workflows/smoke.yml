@@ -1,10 +1,11 @@
-name: Smoke portable notebook ZIP
+name: Verify combined portable notebook ZIP
 on:
   push:
-    branches: [capy/arn20-portable-smoke]
+    branches: [capy/arn29-portable-smoke]
 permissions:
   contents: read
   actions: read
+  pull-requests: read
 jobs:
   verify:
     if: github.repository == 'ArnoGevorkyan/zed'
@@ -19,19 +20,24 @@ jobs:
           if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_ARCH -ne 'X64' -or (Test-Path 'crates') -or (Test-Path 'assets')) { throw 'Expected clean hosted Windows without product sources' }
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          run-id: 45870655441
+          run-id: 45883731469
           github-token: ${{ github.token }}
-          name: arn20-payload
+          name: arn29-payload
           path: payload
+      - name: Generate the synthetic scrolling example
+        run: |
+          python -m pip install --only-binary=:all: pillow==11.3.0 psutil==7.0.0 pywin32==311 rapidocr_onnxruntime==1.4.4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python ./exercise.py --make-example
       - name: Zip and extract the user package
         run: |
-          Copy-Item Notebook.ipynb,TRY-ME.txt payload
+          Copy-Item Notebook.ipynb,TRY-ME.txt,'Open Notebook.cmd' payload
           Compress-Archive payload/* Zed-notebook-win-x64.zip
           $hash = (Get-FileHash Zed-notebook-win-x64.zip).Hash
           "$hash  Zed-notebook-win-x64.zip" | Set-Content SHA256.txt
           Get-Content SHA256.txt
-          Expand-Archive Zed-notebook-win-x64.zip "$env:RUNNER_TEMP\Zed notebook"
-          $exe = "$env:RUNNER_TEMP\Zed notebook\Zed.exe"
+          Expand-Archive Zed-notebook-win-x64.zip "$env:RUNNER_TEMP\preview"
+          $exe = "$env:RUNNER_TEMP\preview\Zed.exe"
           $file = [System.IO.File]::OpenRead($exe)
           $reader = [System.IO.BinaryReader]::new($file)
           $file.Position = 60
@@ -39,24 +45,39 @@ jobs:
           if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) { throw 'Not a Windows x64 executable' }
           $reader.Close()
           if ((Get-AuthenticodeSignature $exe).Status -ne 'NotSigned') { throw 'Unexpected signature state' }
-          python -c "import mmap,sys; f=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); assert m.find(b'951330f9cbee1bd698e01ddea460f797d6409e91') >= 0" "$exe"
+          python -c "import mmap,sys; f=open(sys.argv[1],'rb'); m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); assert m.find(b'fcb699e2a6df70be5aa15d867521931019862c9a') >= 0" "$exe"
           if ($LASTEXITCODE) { throw 'Embedded product revision not found' }
+          New-Item -Force -ItemType Directory "$env:RUNNER_TEMP\proof"
+          Copy-Item SHA256.txt "$env:RUNNER_TEMP\proof"
+          Get-FileHash $exe | Out-File -Width 200 "$env:RUNNER_TEMP\proof\exe-sha256.txt"
           Remove-Item payload -Recurse -Force
       - name: Launch the extracted preview outside the build tree
         run: |
-          ./smoke.ps1 -PackageDir "$env:RUNNER_TEMP\Zed notebook" -EvidenceDir "$env:RUNNER_TEMP\proof"
+          ./smoke.ps1 -PackageDir "$env:RUNNER_TEMP\preview" -EvidenceDir "$env:RUNNER_TEMP\proof"
+      - name: Launch with the bundled script and return to unsaved cells
+        run: python ./source.py
+      - name: Drag both thumbs and exercise Windows mouse gestures
+        if: ${{ !cancelled() && hashFiles('exercise.py') != '' }}
+        env:
+          SCROLL_CANDIDATE: '1'
+        run: python ./exercise.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: hosted-preview-evidence
+          name: combined-windows-evidence
           path: ${{ runner.temp }}/proof
           retention-days: 14
+      - name: Ensure both reviewed fork heads still match the binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $source = gh api repos/ArnoGevorkyan/zed/pulls/8 --jq .head.sha
+          $scroll = gh api repos/ArnoGevorkyan/zed/pulls/9 --jq .head.sha
+          if ($source -ne 'e4cad4de337dc1449ba8d942ec569ad18634e7da' -or $scroll -ne '21401947fcc6b12fc0b3c36dfe58d3f0267af945') { throw 'Fork heads changed; stop before delivery' }
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: Zed-notebook-win-x64
-          path: |
-            Zed-notebook-win-x64.zip
-            SHA256.txt
+          archive: false
+          path: Zed-notebook-win-x64.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 30

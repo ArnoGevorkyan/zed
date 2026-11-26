@@ -1,16 +1,34 @@
 Zed notebook preview for Windows x64
 ====================================
 
-Extract the entire ZIP. In PowerShell, change to the folder containing Zed.exe:
+Extract the entire ZIP, then double-click "Open Notebook.cmd". Keep all
+files together. The launcher opens the synthetic Notebook.ipynb in a new
+temporary profile. Do not run Zed.exe from inside the ZIP.
+
+Or launch manually from PowerShell in the extracted folder:
 
     $profileDir = Join-Path $env:TEMP ("zed-notebook-" + [guid]::NewGuid())
     .\Zed.exe --user-data-dir "$profileDir" ".\Notebook.ipynb"
 
 The saved chart opens without Python. Stay in Restricted Mode to view the example.
-To execute it, trust only your own notebook/workspace, then use Run All
-(Ctrl+Shift+Enter). The example needs a local Python environment with
-ipykernel and Pillow to execute. No Python or kernel is included. Run All
-changes the outputs; save a copy if you want to keep the original example.
+Edit Source shows the notebook JSON. Click Back to Notebook at the right
+of the quick-action bar to return to the cells, including unsaved edits.
+If the bar is hidden, use the Open Notebook action instead.
+
+Use File > Open to open the included Scrolling.ipynb for a page long
+enough to scroll and an oversized saved output in the first cell. It
+contains only synthetic markers; you do not need to execute anything.
+The notebook page has a vertical scrollbar when it overflows; a wide
+output has its own horizontal scrollbar. Visibility follows the editor
+scrollbar settings. On Windows, middle-click the page or saved output,
+then move above or below the starting point to scroll. Click or press
+Escape to stop. A code editor keeps its own middle-button behavior.
+
+To execute the example, trust only your own notebook/workspace, then
+use Run All (Ctrl+Shift+Enter). Choose a Python environment with
+ipykernel and Pillow, or accept Set Up Python when offered. Viewing
+does not install Python. Run All changes the outputs; use a copy if
+you want to keep the original example.
 
 This standalone, unsigned development build needs no installer and does not
 replace installed Zed. Only run it if you trust this fork and have checked
