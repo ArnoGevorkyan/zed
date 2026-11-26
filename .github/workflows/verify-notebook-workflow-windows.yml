@@ -1,7 +1,7 @@
 name: Verify Python notebook workflow on Windows
 on:
   push:
-    branches: [capy/verify-notebook-repair-06ec10bf]
+    branches: [capy/verify-notebook-repair-a3cdac3d]
 permissions:
   contents: read
 jobs:
@@ -19,13 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          ref: 06ec10bf46c7485e47c7ce6f1bdf759ba6a4cfd4
+          ref: a3cdac3d5d5cc07b732499116bc3de0177755e1f
           persist-credentials: false
       - name: Verify product revision
         id: verify_product
         shell: pwsh
         run: |
-          if ((git rev-parse HEAD) -ne '06ec10bf46c7485e47c7ce6f1bdf759ba6a4cfd4') { throw 'Unexpected checkout' }
+          if ((git rev-parse HEAD) -ne 'a3cdac3d5d5cc07b732499116bc3de0177755e1f') { throw 'Unexpected checkout' }
           if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Requires standard hosted runner' }
           [Environment]::OSVersion.VersionString
           git log -1 --oneline
