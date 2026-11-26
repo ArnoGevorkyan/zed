@@ -1,4 +1,7 @@
 import hashlib
+import base64
+import io
+import json
 import ctypes
 import os
 from pathlib import Path
@@ -93,6 +96,13 @@ def show_chart(app, name):
     Q.CGWarpMouseCursorPosition(pos)
     move = Q.CGEventCreateMouseEvent(None, Q.kCGEventMouseMoved, pos, Q.kCGMouseButtonLeft)
     Q.CGEventPost(Q.kCGHIDEventTap, move)
+    saved = json.loads(file.read_bytes())
+    image, = [o["data"]["image/png"] for o in saved["cells"][2]["outputs"] if "image/png" in o.get("data", {})]
+    expected = np.asarray(Image.open(io.BytesIO(base64.b64decode(image))).convert("RGB"), dtype=int)
+    height, width, _ = expected.shape
+    marks = np.all(np.abs(expected - [18, 115, 138]) <= 8, axis=2)
+    anchor_y, anchor_x = np.argwhere(marks)[0]
+    ink = np.min(expected, axis=2) < 180
     for _ in range(15):
         if A.NSWorkspace.sharedWorkspace().frontmostApplication().processIdentifier() != app.pid:
             raise RuntimeError("Zed lost focus before scrolling")
@@ -103,13 +113,14 @@ def show_chart(app, name):
         shot(app, name)
         pixels = np.asarray(Image.open(proof/f"{name}.png").convert("RGB"), dtype=int)
         y, x = np.where(np.all(np.abs(pixels - [18, 115, 138]) <= 8, axis=2))
-        points = set(zip(x.tolist(), y.tolist()))
-        for scale in (0.75, 1, 1.25, 1.5, 2):
-            for left, bottom in points:
-                if all((left + round(dx*scale), bottom - round(dy*scale)) in points for dx,dy in [(70,35),(141,70),(211,105),(282,140)]):
-                    print(f"All five teal plot markers visible on screen at scale {scale}")
-                    return
-    raise RuntimeError("The reopened screenshot does not show all five plot markers")
+        for top, left in zip(y - anchor_y, x - anchor_x):
+            if min(top, left) < 0:
+                continue
+            crop = pixels[top:top+height, left:left+width]
+            if crop.shape == expected.shape and np.abs(crop[ink] - expected[ink]).mean() < 5:
+                print(f"Full {width}x{height} saved plot matched the window at x={left}, y={top}")
+                return
+    raise RuntimeError("The full saved chart did not match the reopened screenshot")
 
 cmd, shift = Q.kCGEventFlagMaskCommand, Q.kCGEventFlagMaskShift
 app = launch("first")
