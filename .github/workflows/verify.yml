@@ -2,6 +2,7 @@ name: Exercise notebook scrolling on hosted Windows
 on:
   push:
     branches: [capy/verify-notebook-scroll-win]
+    paths: ['exercise.py', '.github/workflows/verify.yml']
 permissions:
   actions: read
   contents: read

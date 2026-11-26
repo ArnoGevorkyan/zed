@@ -1,0 +1,59 @@
+name: Build notebook scrolling candidate
+on:
+  push:
+    branches: [capy/verify-notebook-scroll-win]
+    paths: [.github/workflows/build.yml]
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.repository == 'ArnoGevorkyan/zed'
+    runs-on: windows-2022
+    timeout-minutes: 170
+    env:
+      PRODUCT: cb38c9c47ca19830df575a5095c65ebf9d2c9c77
+      TREE: 36ccbdcd91b1ea406caf64bbd7f0f9920bd065d6
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_PROFILE_RELEASE_FAST_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_FAST_OPT_LEVEL: '1'
+      CARGO_PROFILE_RELEASE_FAST_CODEGEN_UNITS: '32'
+      ZED_RELEASE_CHANNEL: dev
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: cb38c9c47ca19830df575a5095c65ebf9d2c9c77
+          persist-credentials: false
+      - name: Assert hosted runner and clean integrated tree
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Standard hosted Windows x64 required' }
+          if ((git rev-parse HEAD) -ne $env:PRODUCT -or (git rev-parse 'HEAD^{tree}') -ne $env:TREE -or (git status --porcelain)) { throw 'Unexpected source tree' }
+          git log -4 --oneline
+      - name: Compile with embedded release assets
+        run: cargo build --locked --profile release-fast -p zed --bin zed
+      - name: Stage portable runtime
+        run: |
+          $out = mkdir payload
+          Copy-Item target/release-fast/zed.exe "$out/Zed.exe"
+          Copy-Item LICENSE-GPL,LICENSE-APACHE $out
+          $vc = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT' -Directory | Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$vc) { throw 'Missing x64 VC redistributables' }
+          Copy-Item "$vc\*.dll" $out
+          $vs = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' | Select-Object -Last 1
+          & $vs.FullName /dependents "$out/Zed.exe"
+          if ($LASTEXITCODE) { throw 'PE import check failed' }
+          $url = 'https://github.com/microsoft/terminal/releases/download/v1.25.1912.0/Microsoft.Windows.Console.ConPTY.1.25.260710002-preview.nupkg'
+          Invoke-WebRequest $url -OutFile conpty.zip
+          if ((Get-FileHash conpty.zip).Hash -ne '05fe9b571ea4fb198f5012405cb39a132cf23eee50feaa496524c149b2502692') { throw 'Unexpected ConPTY package' }
+          Expand-Archive conpty.zip conpty
+          mkdir "$out/x64"
+          Copy-Item conpty/build/native/runtimes/x64/OpenConsole.exe "$out/x64/"
+          Copy-Item conpty/runtimes/win-x64/native/conpty.dll $out
+          Get-ChildItem conpty -Recurse -File -Include 'LICENSE*','NOTICE*' | ForEach-Object { Copy-Item $_.FullName "$out/ConPTY-$($_.Name)" }
+          "Product $env:PRODUCT (tree $env:TREE); hosted Windows x64; embedded assets; unsigned development preview." | Set-Content "$out/BUILD.txt"
+          Get-FileHash "$out/Zed.exe"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: scroll-payload
+          path: payload/
+          retention-days: 5
+          if-no-files-found: error
