@@ -236,6 +236,7 @@ def exercise(count, name):
         assert snap.size == (1024,768), snap.size
         before = path.read_bytes()
         run_inputs(count,name)
+        top(name+"-selected-cell-visible")
         key(90)
         key(17,83)
         assert path.read_bytes() == before, "mode probe or mouse input edited the saved notebook"
