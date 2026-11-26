@@ -1,7 +1,7 @@
 name: Verify Python notebook workflow on Windows
 on:
   push:
-    branches: [capy/verify-notebook-repair-3059d646]
+    branches: [capy/verify-notebook-repair-3a544999]
 permissions:
   contents: read
 jobs:
@@ -19,23 +19,26 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          ref: 3059d64663da7b0af2ff4a044d9f5dba60883752
+          ref: 3a5449990b5670b1857f72dfa1a31cc5340ab605
           persist-credentials: false
       - name: Verify product revision
+        id: verify_product
         shell: pwsh
         run: |
-          if ((git rev-parse HEAD) -ne '3059d64663da7b0af2ff4a044d9f5dba60883752') { throw 'Unexpected checkout' }
+          if ((git rev-parse HEAD) -ne '3a5449990b5670b1857f72dfa1a31cc5340ab605') { throw 'Unexpected checkout' }
           if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Requires standard hosted runner' }
           [Environment]::OSVersion.VersionString
           git log -1 --oneline
       - name: Test notebook source, trust, execution and saved plot
         run: cargo test --locked -p repl --lib
       - name: Install isolated Python and verify chart
+        if: ${{ !cancelled() && steps.verify_product.outcome == 'success' }}
         shell: pwsh
         run: |
           cargo test --locked -p repl --lib install_and_reuse_a_working_notebook_kernel -- --ignored | Tee-Object -Variable result
           if ($LASTEXITCODE -ne 0 -or -not ($result -match 'test result: ok\. 1 passed')) { throw 'Managed install and chart test did not pass' }
       - name: Check sibling imports with a local Python kernel
+        if: ${{ !cancelled() && steps.verify_product.outcome == 'success' }}
         shell: pwsh
         run: |
           $venv = Join-Path $env:RUNNER_TEMP 'notebook-repair-venv'
