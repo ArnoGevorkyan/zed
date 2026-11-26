@@ -11,8 +11,8 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 170
     env:
-      PRODUCT: cb38c9c47ca19830df575a5095c65ebf9d2c9c77
-      TREE: 36ccbdcd91b1ea406caf64bbd7f0f9920bd065d6
+      PRODUCT: 33adfba3884c48b2fa7f8c303b7dc01f489b7061
+      TREE: 63214e4eb9eac8a56e8a487346b0ff529499e81b
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_PROFILE_RELEASE_FAST_DEBUG: '0'
       CARGO_PROFILE_RELEASE_FAST_OPT_LEVEL: '1'
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          ref: cb38c9c47ca19830df575a5095c65ebf9d2c9c77
+          ref: 33adfba3884c48b2fa7f8c303b7dc01f489b7061
           persist-credentials: false
       - name: Assert hosted runner and clean integrated tree
         run: |
