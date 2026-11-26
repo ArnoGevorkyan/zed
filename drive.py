@@ -76,7 +76,23 @@ def kernels():
 def focus(app):
     native = A.NSRunningApplication.runningApplicationWithProcessIdentifier_(app.pid)
     native.activateWithOptions_(A.NSApplicationActivateIgnoringOtherApps)
-    time.sleep(1)
+    for _ in range(30):
+        A.NSRunLoop.currentRunLoop().runUntilDate_(A.NSDate.dateWithTimeIntervalSinceNow_(0.2))
+        if A.NSWorkspace.sharedWorkspace().frontmostApplication().processIdentifier() == app.pid:
+            return
+    raise RuntimeError("Could not activate the verified Zed window")
+
+def show_chart(app, name):
+    bounds = windows(app)[0]["kCGWindowBounds"]
+    pos = (bounds["X"] + bounds["Width"] * 0.4, bounds["Y"] + bounds["Height"] * 0.7)
+    if not post or not ax:
+        raise RuntimeError("Cannot scroll without event-posting permission")
+    for _ in range(3):
+        scroll = Q.CGEventCreateScrollWheelEvent(None, Q.kCGScrollEventUnitPixel, 1, -115)
+        Q.CGEventSetLocation(scroll, pos)
+        Q.CGEventPostToPid(app.pid, scroll)
+        time.sleep(0.4)
+    shot(app, name)
 
 cmd, shift = Q.kCGEventFlagMaskCommand, Q.kCGEventFlagMaskShift
 app = launch("first")
@@ -116,13 +132,10 @@ app.wait(timeout=30)
 digest = hashlib.sha256(file.read_bytes()).hexdigest()
 app = launch("reopen")
 time.sleep(4)
-focus(app)
 shot(app, "07-reopen")
-key(125)
-key(125)
-shot(app, "08-reopened-chart")
 assert not kernels(), "Reopening started a kernel"
 assert digest == hashlib.sha256(file.read_bytes()).hexdigest(), "Reopening changed the file"
 print("Reopened with kernel stopped and file unchanged: " + digest)
-key(12, cmd)
+show_chart(app, "08-reopened-chart")
+assert A.NSRunningApplication.runningApplicationWithProcessIdentifier_(app.pid).terminate()
 app.wait(timeout=30)
