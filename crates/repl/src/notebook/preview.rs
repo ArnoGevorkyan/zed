@@ -82,6 +82,35 @@ pub(super) fn init(cx: &mut App) {
 }
 
 impl NotebookPreview {
+    fn source_buffer(
+        editor: &Editor,
+        project: &Project,
+        cx: &App,
+    ) -> Option<(Entity<language::Buffer>, ProjectPath)> {
+        let buffer = editor.buffer().read(cx).as_singleton()?;
+        let source = buffer.read(cx);
+        if !source.capability().editable() || source.file()?.disk_state().is_deleted() {
+            return None;
+        }
+        let path = source.project_path(cx)?;
+        NotebookItem::supports_path(project, &path, cx).then_some((buffer, path))
+    }
+
+    pub fn back_to_notebook_button(editor: &Editor, cx: &App) -> Option<Div> {
+        Self::source_buffer(editor, editor.project()?.read(cx), cx)?;
+        let focus = editor.focus_handle(cx);
+        Some(
+            div().debug_selector(|| "back-to-notebook".into()).child(
+                Button::new("back-to-notebook", "Back to Notebook")
+                    .start_icon(Icon::new(IconName::Book))
+                    .on_click(move |_, window, cx| {
+                        focus.focus(window, cx);
+                        window.dispatch_action(Box::new(OpenNotebook), cx);
+                    }),
+            ),
+        )
+    }
+
     fn open(
         workspace: &mut Workspace,
         editor: Entity<Editor>,
@@ -89,15 +118,11 @@ impl NotebookPreview {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
+        let Some((buffer, path)) =
+            Self::source_buffer(editor.read(cx), workspace.project().read(cx), cx)
+        else {
             return;
         };
-        let Some(path) = editor.read(cx).active_project_path(cx) else {
-            return;
-        };
-        if !NotebookItem::supports_path(workspace.project().read(cx), &path, cx) {
-            return;
-        }
         let source_id = editor.read(cx).buffer().entity_id();
         if !explicit {
             if workspace.is_restoring() || editor.is_dirty(cx) {
@@ -156,8 +181,10 @@ impl NotebookPreview {
                     Ok(cells) => cells,
                     Err(error) => {
                         if explicit {
-                            workspace
-                                .show_error(error.context("Could not open notebook cells"), cx);
+                            workspace.show_error(
+                                format!("Could not open notebook cells: {error:#}. Check the notebook source and try again."),
+                                cx,
+                            );
                         }
                         return;
                     }
