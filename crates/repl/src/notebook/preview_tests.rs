@@ -1000,7 +1000,7 @@ async fn save_all_in_an_action_sequence_includes_a_new_cell_edit(cx: &mut TestAp
         let expected = if name == "field.ipynb" {
             original.replace("sample = 1", r#"sample = 1\n"#)
         } else {
-            "sample = 1\n".to_owned()
+            format!("sample = 1{}", language::LineEnding::default().as_str())
         };
         assert_eq!(
             fs.load_bytes(&Path::new(path!("/notebooks")).join(name))
