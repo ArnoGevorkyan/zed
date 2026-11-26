@@ -282,8 +282,8 @@ impl NotebookEditor {
             .shared();
 
         let cells = notebook_item.update(cx, |item, _| std::mem::take(&mut item.notebook.cells));
-        let cell_list = ListState::new(cells.len(), gpui::ListAlignment::Top, px(1000.))
-            .with_uniform_item_height(window.line_height() * 3.);
+        let cell_list =
+            ListState::new(cells.len(), gpui::ListAlignment::Top, px(1000.)).measure_all();
 
         let mut editor = Self {
             project,
@@ -1862,8 +1862,22 @@ impl NotebookEditor {
         if !self.focus_handle.contains_focused(window, cx) {
             self.focus_handle.focus(window, cx);
         }
+        let window_handle = window.window_handle();
+        let cancel_on_escape =
+            cx.listener(move |this, event: &gpui::KeystrokeEvent, window, cx| {
+                if window.window_handle() == window_handle
+                    && event.keystroke.key == "escape"
+                    && this.focus_handle.contains_focused(window, cx)
+                {
+                    this.mouse_autoscroll = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            });
+        let escape = cx.intercept_keystrokes(cancel_on_escape);
         let origin = event.position.y;
         self.mouse_autoscroll = Some(cx.spawn_in(window, async move |this, cx| {
+            let _escape = escape;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
@@ -1988,15 +2002,6 @@ impl Render for NotebookEditor {
             .size_full()
             .key_context(key_context)
             .track_focus(&self.focus_handle)
-            .when(self.mouse_autoscroll.is_some(), |div| {
-                div.capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.mouse_autoscroll = None;
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                }))
-            })
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::confirm_clear_outputs))
             .on_action(
@@ -2777,6 +2782,78 @@ mod tests {
                         cx,
                     );
                 });
+        });
+    }
+
+    #[gpui::test]
+    async fn scroll_notebook_page_with_mouse(cx: &mut TestAppContext) {
+        use crate::notebook::{
+            NotebookPreview,
+            preview::preview_tests::{notebook_workspace, open_file},
+        };
+        use gpui::{Modifiers, OperatingSystem, PlatformInfo, PlatformTarget, point};
+        cx.set_platform_info(PlatformInfo {
+            os: OperatingSystem::Windows,
+            target: PlatformTarget::Native,
+        });
+        let cells: Vec<_> = (0..100).map(|ix| json!({
+            "cell_type": "raw", "id": format!("cell-{ix}"), "source": format!("Row {ix}"), "metadata": {}
+        })).collect();
+        let file =
+            json!({"nbformat":4, "nbformat_minor":5, "metadata":{}, "cells": cells}).to_string();
+        let (_, workspace, cx) = notebook_workspace(json!({"scroll.ipynb": file}), cx).await;
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.scrollbar.get_or_insert_default().show =
+                        Some(settings::ShowScrollbar::Always);
+                });
+            })
+        });
+        open_file("scroll.ipynb", &workspace, cx).await;
+        let notebook = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<NotebookPreview>(cx)
+                .unwrap()
+                .read(cx)
+                .notebook
+                .clone()
+                .unwrap()
+        });
+        let list = notebook.read_with(cx, |notebook, _| notebook.cell_list.clone());
+        let bounds = list.viewport_bounds();
+        assert!(list.max_offset_for_scrollbar().y > px(0.));
+        let origin = bounds.center();
+        let down = point(origin.x, origin.y + px(100.));
+        let modifiers = Modifiers::none();
+        cx.simulate_mouse_down(origin, MouseButton::Middle, modifiers);
+        cx.simulate_mouse_up(origin, MouseButton::Middle, modifiers);
+        cx.simulate_mouse_move(down, None, modifiers);
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(
+            list.scroll_px_offset_for_scrollbar().y < px(0.),
+            "middle-click then move scrolls the page"
+        );
+        cx.simulate_keystrokes("escape");
+        let stopped = list.logical_scroll_top();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert_eq!(list.logical_scroll_top(), stopped, "Escape stops scrolling");
+        let thumb = point(bounds.right() - px(7.), bounds.top() + px(10.));
+        let bottom = point(thumb.x, bounds.bottom() - px(1.));
+        cx.simulate_mouse_down(thumb, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(bottom, MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(bottom, MouseButton::Left, modifiers);
+        assert!(
+            list.bounds_for_item(99)
+                .is_some_and(|last| last.bottom() <= bounds.bottom() + px(1.)),
+            "dragging to the bottom reveals the last cell"
+        );
+        notebook.read_with(cx, |notebook, _| {
+            assert_eq!(notebook.selected_cell_index, 0);
+            assert!(matches!(notebook.notebook_mode, NotebookMode::Command));
+            assert!(notebook.execution_requests.is_empty());
         });
     }
 
