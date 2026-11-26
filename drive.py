@@ -10,6 +10,8 @@ import AppKit as A
 import Metal
 import Quartz as Q
 import psutil
+import numpy as np
+from PIL import Image
 
 root = Path(os.environ["NOTEBOOK_ROOT"])
 project = root / "project"
@@ -87,12 +89,27 @@ def show_chart(app, name):
     pos = (bounds["X"] + bounds["Width"] * 0.4, bounds["Y"] + bounds["Height"] * 0.7)
     if not post or not ax:
         raise RuntimeError("Cannot scroll without event-posting permission")
-    for _ in range(3):
-        scroll = Q.CGEventCreateScrollWheelEvent(None, Q.kCGScrollEventUnitPixel, 1, -115)
+    focus(app)
+    Q.CGWarpMouseCursorPosition(pos)
+    move = Q.CGEventCreateMouseEvent(None, Q.kCGEventMouseMoved, pos, Q.kCGMouseButtonLeft)
+    Q.CGEventPost(Q.kCGHIDEventTap, move)
+    for _ in range(15):
+        if A.NSWorkspace.sharedWorkspace().frontmostApplication().processIdentifier() != app.pid:
+            raise RuntimeError("Zed lost focus before scrolling")
+        scroll = Q.CGEventCreateScrollWheelEvent(None, Q.kCGScrollEventUnitLine, 1, -3)
         Q.CGEventSetLocation(scroll, pos)
-        Q.CGEventPostToPid(app.pid, scroll)
-        time.sleep(0.4)
-    shot(app, name)
+        Q.CGEventPost(Q.kCGHIDEventTap, scroll)
+        time.sleep(0.6)
+        shot(app, name)
+        pixels = np.asarray(Image.open(proof/f"{name}.png").convert("RGB"), dtype=int)
+        y, x = np.where(np.all(np.abs(pixels - [18, 115, 138]) <= 8, axis=2))
+        points = set(zip(x.tolist(), y.tolist()))
+        for scale in (0.75, 1, 1.25, 1.5, 2):
+            for left, bottom in points:
+                if all((left + round(dx*scale), bottom - round(dy*scale)) in points for dx,dy in [(70,35),(141,70),(211,105),(282,140)]):
+                    print(f"All five teal plot markers visible on screen at scale {scale}")
+                    return
+    raise RuntimeError("The reopened screenshot does not show all five plot markers")
 
 cmd, shift = Q.kCGEventFlagMaskCommand, Q.kCGEventFlagMaskShift
 app = launch("first")

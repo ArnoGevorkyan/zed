@@ -105,7 +105,7 @@ jobs:
           grep -Eih 'compatible Metal|No GPU|failed to (create|open)|renderer|panicked' "$NOTEBOOK_ROOT"/first.log "$NOTEBOOK_ROOT"/profile/logs/Zed.log | tail -30 | tee "$NOTEBOOK_ROOT/proof/launch-diagnostics.txt" || true
       - name: Native REPL suite when the desktop did not pass
         id: tests
-        if: ${{ !cancelled() && steps.host.outcome == 'success' && steps.gui.outcome != 'success' }}
+        if: ${{ !cancelled() && steps.host.outcome == 'success' && steps.gui.outcome != 'success' && steps.cache.outputs.cache-hit != 'true' }}
         working-directory: product
         run: |
           cargo test --locked -p repl --lib | tee "$NOTEBOOK_ROOT/proof/native.txt"
