@@ -1145,8 +1145,9 @@ impl Render for CodeCell {
                     .child(
                         div().py_1p5().w_full().child(
                             div()
-                                .relative()
                                 .flex()
+                                .items_start()
+                                .gap_2()
                                 .size_full()
                                 .flex_1()
                                 .py_3()
@@ -1155,14 +1156,12 @@ impl Render for CodeCell {
                                 .border_1()
                                 .border_color(cx.theme().colors().border)
                                 .bg(cx.theme().colors().editor_background)
-                                .child(div().w_full().child(self.editor.clone()))
+                                .child(div().flex_1().min_w_0().child(self.editor.clone()))
                                 // lang badge in top-right corner
                                 .when_some(language_name, |this, name| {
                                     this.child(
                                         div()
-                                            .absolute()
-                                            .top_1()
-                                            .right_2()
+                                            .flex_none()
                                             .px_2()
                                             .py_0p5()
                                             .rounded_md()
@@ -1277,20 +1276,26 @@ impl Render for CodeCell {
                                         })
                                         .child(
                                             div()
+                                                .flex()
+                                                .items_start()
                                                 .id((
                                                     ElementId::from(self.id.to_string()),
                                                     "output-scroll",
                                                 ))
                                                 .w_full()
+                                                .overflow_x_scroll()
+                                                .restrict_scroll_to_axis()
                                                 .when_some(output_max_width, |div, max_width| {
-                                                    div.max_w(max_width).overflow_x_scroll()
+                                                    div.max_w(max_width)
                                                 })
                                                 .when_some(output_max_height, |div, max_height| {
                                                     div.max_h(max_height).overflow_y_scroll()
                                                 })
-                                                .children(self.outputs.iter().map(|output| {
-                                                    div().children(output.content(window, cx))
-                                                })),
+                                                .child(v_flex().flex_none().min_w_full().children(
+                                                    self.outputs.iter().filter_map(|output| {
+                                                        output.content(window, cx)
+                                                    }),
+                                                )),
                                         ),
                                 ),
                             ),
