@@ -449,6 +449,11 @@ impl Item for NotebookPreview {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if let Some(notebook) = &self.notebook
+            && let Err(error) = notebook.update(cx, |notebook, cx| notebook.flush_cell_edits(cx))
+        {
+            return Task::ready(Err(error));
+        }
         self.editor
             .update(cx, |editor, cx| editor.save_as(project, path, window, cx))
     }
@@ -517,6 +522,11 @@ impl SerializableItem for NotebookPreview {
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
         let workspace_id = workspace.database_id()?;
+        if let Some(notebook) = &self.notebook
+            && let Err(error) = notebook.update(cx, |notebook, cx| notebook.flush_cell_edits(cx))
+        {
+            return Some(Task::ready(Err(error)));
+        }
         let editor = self.editor.read(cx);
         let (buffer, dirty_snapshot) = editor.buffer_for_session(closing, cx)?;
         let path = editor.active_project_path(cx)?;

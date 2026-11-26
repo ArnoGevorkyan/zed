@@ -364,7 +364,7 @@ async fn test_restore_unsaved_notebook_after_disk_edit(cx: &mut TestAppContext) 
         Workspace::new(Some(workspace_id), project, app_state, window, cx)
     });
     open_file("field.ipynb", &workspace, cx).await;
-    let item_id = workspace.update_in(cx, |ws, window, cx| {
+    let (item_id, serialized) = workspace.update_in(cx, |ws, window, cx| {
         let view = ws
             .active_item_as::<NotebookPreview>(cx)
             .expect("notebook tab");
@@ -380,8 +380,23 @@ async fn test_restore_unsaved_notebook_after_disk_edit(cx: &mut TestAppContext) 
             .expect("editor")
             .clone();
         cell_editor.update(cx, |editor, cx| editor.set_text("unsaved = 1", window, cx));
-        view.entity_id().as_u64()
+        let id = view.entity_id().as_u64();
+        let serialized = view.update(cx, |view, cx| view.serialize(ws, id, false, cx).unwrap());
+        (id, serialized)
     });
+    serialized.await.expect("serialize pending cell edit");
+    let snapshot = cx.update(|_, cx| {
+        super::persistence::NotebookPreviewDb::global(cx)
+            .get_notebook(item_id, workspace_id)
+            .unwrap()
+            .unwrap()
+            .1
+            .unwrap()
+    });
+    assert_eq!(
+        snapshot,
+        NOTEBOOK.replace("print('from source')", "unsaved = 1")
+    );
     cx.run_until_parked();
     cx.executor()
         .advance_clock(workspace::SERIALIZATION_THROTTLE_TIME);
@@ -777,5 +792,162 @@ async fn an_unrelated_cell_edit_does_not_unblock_save(cx: &mut TestAppContext) {
             .await
             .unwrap(),
         NOTEBOOK.as_bytes()
+    );
+}
+
+#[gpui::test]
+async fn batched_cell_history_saves_the_visible_source(cx: &mut TestAppContext) {
+    let original = NOTEBOOK.replace("print('from source')", "sample = 1");
+    let (fs, workspace, cx) = notebook_workspace(json!({"field.ipynb": original}), cx).await;
+    open_file("field.ipynb", &workspace, cx).await;
+    let editors = |cx: &mut VisualTestContext| {
+        workspace.read_with(cx, |workspace, cx| {
+            let view = workspace.active_item_as::<NotebookPreview>(cx).unwrap();
+            let view = view.read(cx);
+            let code = view
+                .notebook
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .cell(1)
+                .unwrap()
+                .editor(cx)
+                .unwrap()
+                .clone();
+            (code, view.editor.clone())
+        })
+    };
+    let (code, raw) = editors(cx);
+    code.update_in(cx, |editor, window, cx| {
+        editor.move_to_end(&Default::default(), window, cx);
+        editor.insert("1", window, cx);
+        editor.finalize_last_transaction(cx);
+    });
+    cx.run_until_parked();
+    code.update_in(cx, |editor, window, cx| editor.insert("2", window, cx));
+    cx.run_until_parked();
+    code.update_in(cx, |editor, window, cx| {
+        editor.undo(&editor::actions::Undo, window, cx);
+        editor.undo(&editor::actions::Undo, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        code.read_with(cx, |editor, cx| editor.text(cx)),
+        "sample = 1"
+    );
+    assert_eq!(raw.read_with(cx, |editor, cx| editor.text(cx)), original);
+    assert!(!raw.read_with(cx, |editor, cx| workspace::Item::is_dirty(editor, cx)));
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    cx.run_until_parked();
+    assert_eq!(
+        fs.load_bytes(Path::new(path!("/notebooks/field.ipynb")))
+            .await
+            .unwrap(),
+        original.as_bytes()
+    );
+    code.update_in(cx, |editor, window, cx| {
+        editor.redo(&editor::actions::Redo, window, cx);
+        editor.redo(&editor::actions::Redo, window, cx);
+    });
+    cx.run_until_parked();
+    code.update_in(cx, |editor, window, cx| {
+        editor.undo(&editor::actions::Undo, window, cx)
+    });
+    cx.run_until_parked();
+    let saved = original.replace("sample = 1", "sample = 11");
+    assert_eq!(
+        code.read_with(cx, |editor, cx| editor.text(cx)),
+        "sample = 11"
+    );
+    assert_eq!(raw.read_with(cx, |editor, cx| editor.text(cx)), saved);
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    cx.run_until_parked();
+    assert_eq!(
+        fs.load_bytes(Path::new(path!("/notebooks/field.ipynb")))
+            .await
+            .unwrap(),
+        saved.as_bytes()
+    );
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    open_file("field.ipynb", &workspace, cx).await;
+    let (code, raw) = editors(cx);
+    assert_eq!(
+        code.read_with(cx, |editor, cx| editor.text(cx)),
+        "sample = 11"
+    );
+    assert_eq!(raw.read_with(cx, |editor, cx| editor.text(cx)), saved);
+    code.update_in(cx, |editor, window, cx| {
+        editor.move_to_end(&Default::default(), window, cx);
+        editor.insert("2", window, cx);
+        editor.finalize_last_transaction(cx);
+    });
+    cx.run_until_parked();
+    code.update_in(cx, |editor, window, cx| {
+        editor.undo(&editor::actions::Undo, window, cx);
+        editor.insert("3", window, cx);
+        editor.finalize_last_transaction(cx);
+        editor.insert("4", window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        code.read_with(cx, |editor, cx| editor.text(cx)),
+        "sample = 1134"
+    );
+    assert_eq!(
+        raw.read_with(cx, |editor, cx| editor.text(cx)),
+        original.replace("sample = 1", "sample = 1134")
+    );
+    code.update_in(cx, |editor, window, cx| {
+        editor.undo(&editor::actions::Undo, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        code.read_with(cx, |editor, cx| editor.text(cx)),
+        "sample = 113"
+    );
+    assert_eq!(
+        raw.read_with(cx, |editor, cx| editor.text(cx)),
+        original.replace("sample = 1", "sample = 113")
+    );
+    cx.dispatch_action(workspace::SaveAll { save_intent: None });
+    cx.run_until_parked();
+    cx.dispatch_action(workspace::pane::CloseActiveItem::default());
+    open_file("field.ipynb", &workspace, cx).await;
+    assert_eq!(
+        editors(cx).0.read_with(cx, |editor, cx| editor.text(cx)),
+        "sample = 113"
+    );
+    let (code, _) = editors(cx);
+    let view = workspace.read_with(cx, |workspace, cx| {
+        workspace.active_item_as::<NotebookPreview>(cx).unwrap()
+    });
+    let save = view.update_in(cx, |view, window, cx| {
+        let project = view.editor.read(cx).project().unwrap().clone();
+        code.update(cx, |editor, cx| {
+            editor.move_to_end(&Default::default(), window, cx);
+            editor.insert("5", window, cx);
+        });
+        workspace::Item::save(view, Default::default(), project, window, cx)
+    });
+    save.await.unwrap();
+    assert_eq!(
+        fs.load_bytes(Path::new(path!("/notebooks/field.ipynb")))
+            .await
+            .unwrap(),
+        original.replace("sample = 1", "sample = 1135").as_bytes()
+    );
+    let save_as = view.update_in(cx, |view, window, cx| {
+        let project = view.editor.read(cx).project().unwrap().clone();
+        let mut path = workspace::Item::active_project_path(view, cx).unwrap();
+        path.path = rel_path("copy.ipynb").into();
+        code.update(cx, |editor, cx| editor.insert("6", window, cx));
+        workspace::Item::save_as(view, project, path, window, cx)
+    });
+    save_as.await.unwrap();
+    assert_eq!(
+        fs.load_bytes(Path::new(path!("/notebooks/copy.ipynb")))
+            .await
+            .unwrap(),
+        original.replace("sample = 1", "sample = 11356").as_bytes()
     );
 }

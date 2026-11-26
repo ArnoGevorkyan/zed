@@ -15432,6 +15432,7 @@ dependencies = [
  "tempfile",
  "terminal",
  "terminal_view",
+ "text",
  "theme",
  "theme_settings",
  "tree-sitter-md",
