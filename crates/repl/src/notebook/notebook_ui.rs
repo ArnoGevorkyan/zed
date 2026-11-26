@@ -1783,12 +1783,17 @@ impl NotebookEditor {
             .gap_2()
             .bg(cx.theme().colors().status_bar_background)
             .child(
-                Button::new("kernel-selector", name)
-                    .label_size(LabelSize::Small)
-                    .disabled(self.kernel_task.is_some() || !self.project.read(cx).is_local())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.choose_or_start_kernel(None, window, cx);
-                    })),
+                div().min_w_0().child(
+                    Button::new("kernel-selector", name.clone())
+                        .full_width()
+                        .truncate(true)
+                        .tooltip(Tooltip::text(name))
+                        .label_size(LabelSize::Small)
+                        .disabled(self.kernel_task.is_some() || !self.project.read(cx).is_local())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.choose_or_start_kernel(None, window, cx);
+                        })),
+                ),
             )
             .when(Self::remote_enabled(cx), |bar| {
                 bar.child(
@@ -1805,13 +1810,18 @@ impl NotebookEditor {
             .child(
                 div()
                     .id("kernel-status")
+                    .min_w_0()
+                    .when(
+                        self.kernel_notice.is_none()
+                            && !matches!(self.kernel, Kernel::ErroredLaunch(_)),
+                        |this| this.flex_shrink_0(),
+                    )
                     .child(
                         Label::new(notice.lines().next().unwrap_or_default().to_owned())
-                            .size(LabelSize::Small),
+                            .size(LabelSize::Small)
+                            .truncate(),
                     )
-                    .when(notice.contains('\n'), |this| {
-                        this.tooltip(Tooltip::text(notice))
-                    }),
+                    .tooltip(Tooltip::text(notice)),
             )
             .when(matches!(self.kernel, Kernel::RunningKernel(_)), |bar| {
                 bar.child(
