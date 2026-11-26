@@ -100,7 +100,7 @@ fn install_in(directory: PathBuf, cx: &App) -> Task<Result<PathBuf>> {
             &executor, client, &url, Some(sha256), &directory, AssetKind::TarGz,
         )
         .await
-        .context("downloading the notebook's Python runtime")?;
+        .context("Could not download Python. Check your connection, then run the cell again.")?;
         let python = interpreter(&directory);
         let scratch = tempfile::tempdir_in(parent)?;
         let install = [
@@ -120,7 +120,7 @@ fn install_in(directory: PathBuf, cx: &App) -> Task<Result<PathBuf>> {
         ];
         run_python(&python, scratch.path(), &install)
             .await
-            .context("installing notebook packages")?;
+            .context("Could not install the notebook packages. Run the cell again to retry.")?;
         run_python(
             &python,
             scratch.path(),

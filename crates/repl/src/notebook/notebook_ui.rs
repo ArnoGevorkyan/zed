@@ -524,7 +524,13 @@ impl NotebookEditor {
             let result = Self::prepare_kernel(&this, selected, fs, run.as_ref(), cx).await;
             this.update_in(cx, |editor, window, cx| {
                 editor.kernel_task = None;
-                editor.kernel_notice = result.err().map(|error| format!("{error:#}"));
+                editor.kernel_notice = result.err().map(|error| {
+                    error
+                        .chain()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
                 if editor
                     .kernel_session
                     .take_if(|_| matches!(editor.kernel, Kernel::Shutdown))
@@ -1041,7 +1047,17 @@ impl NotebookEditor {
                         this.choose_or_start_kernel(None, window, cx);
                     })),
             )
-            .child(Label::new(notice).size(LabelSize::Small))
+            .child(
+                div()
+                    .id("kernel-status")
+                    .child(
+                        Label::new(notice.lines().next().unwrap_or_default().to_owned())
+                            .size(LabelSize::Small),
+                    )
+                    .when(notice.contains('\n'), |this| {
+                        this.tooltip(Tooltip::text(notice))
+                    }),
+            )
             .when(matches!(self.kernel, Kernel::RunningKernel(_)), |bar| {
                 bar.child(
                     IconButton::new("stop-kernel", IconName::Power)
