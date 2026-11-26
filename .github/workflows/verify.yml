@@ -1,0 +1,37 @@
+name: Verify first-run Python setup in delivered ZIP
+on:
+  push:
+    branches: [capy/arn23-hosted-first-run]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  desktop:
+    if: github.repository == 'ArnoGevorkyan/zed'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45877875919
+          name: Zed-notebook-win-x64
+          path: download
+      - name: Verify the delivered archive, then launch on the hosted desktop
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Hosted Windows x64 only' }
+          $zip = 'download/Zed-notebook-win-x64.zip'
+          if ((Get-FileHash $zip).Hash -ne '98BD7ADC2F85C1971CA735AA3CA8D3C265DA483A254F65F95D8F579B2810177E') { throw 'Wrong ZIP' }
+          Expand-Archive $zip "$env:RUNNER_TEMP\preview"
+          if ((Get-FileHash "$env:RUNNER_TEMP\preview\Zed.exe").Hash -ne 'A620A96E1D76A15FA9B782AC07F365EDAD4C4194C58A30DDE7083523AA48BA4A') { throw 'Wrong executable' }
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -STA -NoProfile -File ./verify.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: first-run-proof
+          path: ${{ runner.temp }}/proof
+          retention-days: 7
