@@ -162,10 +162,11 @@ def run_inputs(count,name):
     move(230,initial[0][0]+8)
     mouse(0x1000,-480)
     time.sleep(.4)
+    wheel_left,m_left = capture(name+"-horizontal-wheel-left")
     mouse(0x1000,480)
     wheel_im,m = capture(name+"-horizontal-wheel")
-    wheel_changed = ImageChops.difference(im.crop(crop),wheel_im.crop(crop)).getbbox() is not None
-    check(name+" horizontal wheel pans only the output",(wheel_changed,m==initial),(count>1,True))
+    wheel_changed = ImageChops.difference(wheel_left.crop(crop),wheel_im.crop(crop)).getbbox() is not None
+    check(name+" horizontal wheel pans only the output",(wheel_changed,m_left==m==initial),(count>1,True))
     if count == 1:
         wheel(-8)
         _,m = capture(name+"-wheel-down")
@@ -227,7 +228,8 @@ def exercise(count, name):
         expected_sources = ["".join(c["source"]) for c in json.loads(before)["cells"]]
         expected_sources[0] += "z"
         check(name+" deliberate edit affects only initially selected cell",sources,expected_sources)
-        (proof/(name+"-selection.txt")).write_text("No edits on plain Z + save in command mode; explicit Enter/Edit/Z changed only the originally selected cell 00.")
+        if sources == expected_sources:
+            (proof/(name+"-selection.txt")).write_text("No edits on plain Z + save in command mode; explicit Enter/Edit/Z changed only the originally selected cell 00.")
         if count > 1:
             _,m = top(name+"-editing-start")
             move(19,182)
