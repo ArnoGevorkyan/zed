@@ -2,7 +2,7 @@ name: Verify candidate notebook scrolling on hosted Windows
 on:
   push:
     branches: [capy/verify-notebook-scroll-win]
-    paths: ['.github/workflows/verify-candidate.yml']
+    paths: ['.github/workflows/verify-candidate.yml', 'exercise.py']
 permissions:
   actions: read
   contents: read

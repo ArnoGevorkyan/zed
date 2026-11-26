@@ -218,6 +218,7 @@ def exercise(count, name):
         key(90)
         key(17,83)
         assert path.read_bytes() == before, "mode probe or mouse input edited the saved notebook"
+        top(name+"-selection-visible-again")
         key(13)
         key(35)
         key(90)
@@ -225,7 +226,7 @@ def exercise(count, name):
         sources = ["".join(c["source"]) for c in json.loads(path.read_text())["cells"]]
         expected_sources = ["".join(c["source"]) for c in json.loads(before)["cells"]]
         expected_sources[0] += "z"
-        assert sources == expected_sources, sources
+        check(name+" deliberate edit affects only initially selected cell",sources,expected_sources)
         (proof/(name+"-selection.txt")).write_text("No edits on plain Z + save in command mode; explicit Enter/Edit/Z changed only the originally selected cell 00.")
         if count > 1:
             _,m = top(name+"-editing-start")
