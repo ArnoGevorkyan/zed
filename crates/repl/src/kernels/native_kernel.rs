@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use futures::{
-    AsyncBufReadExt as _, StreamExt as _,
+    AsyncBufReadExt as _, FutureExt as _, StreamExt as _,
     channel::mpsc::{self},
     io::BufReader,
 };
@@ -239,30 +239,20 @@ impl NativeRunningKernel {
             )
             .await?;
 
-            // A connected SUB socket may still miss the first cell's output until
-            // its subscription reaches the publisher.
-            'ready: loop {
-                shell_socket.send(jupyter_protocol::KernelInfoRequest {}.into()).await?;
-                let retry = executor.timer(std::time::Duration::from_millis(500)).fuse();
-                futures::pin_mut!(retry);
-                loop {
-                    futures::select! {
-                        message = iopub_socket.read().fuse() => {
-                            if message?.parent_header.is_some_and(|header| header.msg_type == "kernel_info_request") {
-                                break 'ready;
-                            }
-                        }
-                        _ = retry => break,
-                    }
-                }
+            if S::IS_NOTEBOOK {
+                wait_for_notebook_iopub(&mut iopub_socket, &mut shell_socket, &executor).await?;
             }
             anyhow::Ok((iopub_socket, shell_socket, control_socket, stdin_socket))
             };
-            use futures::FutureExt as _;
+            let readiness_timeout = if S::IS_NOTEBOOK {
+                executor.timer(std::time::Duration::from_secs(30)).left_future()
+            } else {
+                futures::future::pending().right_future()
+            };
             let (iopub_socket, shell_socket, control_socket, stdin_socket) = futures::select! {
                 sockets = connect.fuse() => sockets?,
                 status = process_status.fuse() => anyhow::bail!("Kernel exited during startup: {}", status?),
-                _ = executor.timer(std::time::Duration::from_secs(30)).fuse() => anyhow::bail!("The kernel did not become ready within 30 seconds"),
+                _ = readiness_timeout.fuse() => anyhow::bail!("The kernel did not become ready within 30 seconds"),
             };
             kill_on_cancel.abort();
             remove_connection.abort();
@@ -308,13 +298,9 @@ impl NativeRunningKernel {
             let session = session.downgrade();
 
             let process_status_task = cx.spawn(async move |cx| {
-                let error_message = match status.await {
-                    Ok(status) => {
-                        format!("kernel process exited with status: {:?}", status)
-                    }
-                    Err(err) => {
-                        format!("kernel process exited with error: {:?}", err)
-                    }
+                let Some(error_message) = kernel_exit_error::<S>(status.await) else {
+                    log::info!("kernel process exited successfully");
+                    return;
                 };
 
                 log::error!("{}", error_message);
@@ -337,6 +323,42 @@ impl NativeRunningKernel {
                 kernel_info: None,
             }) as Box<dyn RunningKernel>)
         })
+    }
+}
+
+async fn wait_for_notebook_iopub(
+    iopub: &mut jupyter_zmq_client::ClientIoPubConnection,
+    shell: &mut jupyter_zmq_client::ClientShellConnection,
+    executor: &gpui::BackgroundExecutor,
+) -> Result<()> {
+    // A connected SUB socket may still miss the first cell's output until
+    // its subscription reaches the publisher.
+    loop {
+        shell
+            .send(jupyter_protocol::KernelInfoRequest {}.into())
+            .await?;
+        let retry = executor.timer(std::time::Duration::from_millis(500)).fuse();
+        futures::pin_mut!(retry);
+        loop {
+            futures::select! {
+                message = iopub.read().fuse() => {
+                    if message?.parent_header.is_some_and(|header| header.msg_type == "kernel_info_request") {
+                        return Ok(());
+                    }
+                }
+                _ = retry => break,
+            }
+        }
+    }
+}
+
+fn kernel_exit_error<S: KernelSession>(
+    status: std::io::Result<std::process::ExitStatus>,
+) -> Option<String> {
+    match status {
+        Ok(status) if status.success() && !S::IS_NOTEBOOK => None,
+        Ok(status) => Some(format!("kernel process exited with status: {status:?}")),
+        Err(error) => Some(format!("kernel process exited with error: {error:?}")),
     }
 }
 
@@ -586,6 +608,14 @@ mod test {
     use gpui::TestAppContext;
     use project::FakeFs;
     use serde_json::json;
+
+    #[test]
+    fn a_clean_native_exit_is_not_an_ordinary_repl_error() {
+        assert_eq!(
+            kernel_exit_error::<crate::Session>(Ok(std::process::ExitStatus::default())),
+            None
+        );
+    }
 
     #[test]
     #[ignore = "requires ZED_NOTEBOOK_TEST_PYTHON pointing to a local interpreter with ipykernel"]

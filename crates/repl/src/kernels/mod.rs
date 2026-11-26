@@ -189,7 +189,7 @@ pub fn start_kernel_tasks<S: KernelSession + 'static>(
             tasks.push(with_name("routing task", routing_task));
             tasks.push(with_name("stdin routing task", stdin_routing_task));
 
-            if let Some((name, result)) = tasks.next().await {
+            while let Some((name, result)) = tasks.next().await {
                 if let Err(err) = result {
                     session
                         .update(cx, |session, cx| {
@@ -198,6 +198,12 @@ pub fn start_kernel_tasks<S: KernelSession + 'static>(
                             cx.notify();
                         })
                         .ok();
+                    break;
+                }
+                // Only the writers finish successfully. Once both close, the
+                // reader can wait forever even after the kernel is gone.
+                if S::IS_NOTEBOOK || tasks.len() == 1 {
+                    break;
                 }
             }
         }
@@ -208,6 +214,8 @@ pub fn start_kernel_tasks<S: KernelSession + 'static>(
 }
 
 pub trait KernelSession: Sized {
+    const IS_NOTEBOOK: bool = false;
+
     fn check_launch(&self, _cx: &mut Context<Self>) -> Result<()> {
         Ok(())
     }
