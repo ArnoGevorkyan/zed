@@ -15441,6 +15441,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-typescript",
  "ui",
+ "ui_prompt",
  "util",
  "uuid",
  "workspace",
@@ -19568,6 +19569,7 @@ dependencies = [
 name = "ui_prompt"
 version = "0.1.0"
 dependencies = [
+ "futures 0.3.34",
  "gpui",
  "markdown",
  "menu",

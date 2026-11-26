@@ -62,6 +62,7 @@ text.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 ui.workspace = true
+ui_prompt.workspace = true
 util.workspace = true
 uuid.workspace = true
 workspace.workspace = true
